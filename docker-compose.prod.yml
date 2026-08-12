@@ -1,0 +1,156 @@
+# IPSA LLM stack — a 5-step interpretation API plus the models it reasons with.
+#
+#   Deploy: docker compose -f docker-compose.prod.yml up -d --build
+#   Logs  : docker compose -f docker-compose.prod.yml logs -f
+#
+# Topology (three services by default):
+#   pipeline-api : 5-step interpretation FastAPI                 -> :6000  (CPU)
+#   llm-router   : OpenAI-compatible router that OWNS the sleep  -> :9000  (CPU)
+#                  lifecycle of the LOCAL reviewer model. Routes by
+#                  the request's "model" field, wakes a sleeping
+#                  model on demand (weights RAM->GPU, ~seconds), and
+#                  sleeps it after IDLE_TIMEOUT_SECONDS idle (vLLM
+#                  sleep level 1 — weights->RAM, frees the GPU).
+#                  Code in ./llm-router.
+#   vllm-openbio : OpenBioLLM-70B reviewer, always-on GPU ${OPENBIO_GPUS}, sleep-enabled
+#
+# Plus one OPTIONAL service, off unless you ask for it:
+#   vllm-gptoss  : gpt-oss-120b reasoning model on GPU ${GPTOSS_GPUS}. Enable with
+#                  `--profile local-gptoss` if you don't already have an
+#                  OpenAI-compatible endpoint to point GPTOSS_API_URL at.
+#
+# Flow: client -> :6000 pipeline-api
+#         -> ${GPTOSS_API_URL} .......... reasoning model: an endpoint you provide, or
+#                                         the optional vllm-gptoss service below
+#         -> llm-router:9000 ->(compose DNS) vllm-openbio ......... (reviewer model)
+#
+# gpt-oss is called DIRECTLY, deliberately bypassing llm-router: the router owns a
+# sleep/wake lifecycle via vLLM's dev endpoints and must never sleep a server this stack
+# does not own. If you point GPTOSS_API_URL at someone else's endpoint, its availability
+# is outside this stack's control.
+#
+# NOTE: the vLLM containers load their weights at startup, so they are warm once healthy
+# (no per-request cold start). Pre-pull the image at deploy time so startup doesn't also
+# wait on an image download (`docker pull vllm/vllm-openai:${VLLM_TAG}`).
+
+services:
+  # 5-step LLM interpretation pipeline (FastAPI) on :6000 — the API clients call.
+  pipeline-api:
+    build:
+      context: ./interpretation-api
+      dockerfile: Dockerfile
+    image: ipsa-pipeline-api:${PIPELINE_TAG:-latest}
+    container_name: ipsa-pipeline-api
+    environment:
+      - LLM_PROVIDER=local
+      # Main reasoning model (gpt-oss). REQUIRED: set GPTOSS_API_URL in .env to a full
+      # OpenAI-compatible chat-completions URL. Two ways to get one:
+      #   - run the optional local service: `--profile local-gptoss`, then use
+      #     http://vllm-gptoss:8001/v1/chat/completions
+      #   - point at an OpenAI-compatible server you already have.
+      # Called direct, not via llm-router, which must not manage sleep/wake on a server
+      # this stack may not own.
+      - LOCAL_LLM_API_URL=${GPTOSS_API_URL:-http://REPLACE-ME-see-README:8001/v1/chat/completions}
+      # The model id must match what your server reports at `GET <base>/v1/models`. A
+      # self-hosted vLLM reports the id it was launched with (`openai/gpt-oss-120b`);
+      # other servers may expose a shorter alias such as `gpt-oss-120b`.
+      - LOCAL_LLM_MODEL=${GPTOSS_MODEL:-openai/gpt-oss-120b}
+      # Cap completion tokens for the main model. The code default is 40000; Step 4's
+      # large prompt + a 40k completion budget can exceed the model's context window and
+      # make vLLM return 500. 16000 leaves ample headroom for hypothesis generation.
+      - LOCAL_LLM_MAX_TOKENS=16000
+      # Reviewer model (OpenBioLLM): local, via llm-router (which owns its sleep lifecycle).
+      - REVIEWER_LLM_API_URL=http://llm-router:9000/v1/chat/completions
+      - REVIEWER_LLM_MODEL=aaditya/Llama3-OpenBioLLM-70B
+      - API_HOST=0.0.0.0
+      - API_PORT=6000
+    ports:
+      - "${PIPELINE_PORT:-6000}:6000"
+    depends_on:
+      - llm-router
+    restart: unless-stopped
+
+  # Sleep-aware OpenAI-compatible router for the LOCAL model. Wakes it on demand and sleeps
+  # it when idle. Reaches the vLLM service by compose DNS — no Docker socket, no host gateway.
+  # Only the reviewer model is behind it; gpt-oss bypasses the router either way.
+  llm-router:
+    build:
+      context: ./llm-router
+      dockerfile: Dockerfile
+    image: ipsa-llm-router:${ROUTER_TAG:-latest}
+    container_name: ipsa-llm-router
+    environment:
+      - UPSTREAMS=aaditya/Llama3-OpenBioLLM-70B=http://vllm-openbio:8002
+      # vLLM sleep level: 1 = offload weights to CPU RAM (fast wake). 2 = discard weights.
+      - SLEEP_LEVEL=${SLEEP_LEVEL:-1}
+      # Sleep a model after this many idle seconds (frees its GPU). Next request auto-wakes it.
+      - IDLE_TIMEOUT_SECONDS=${IDLE_TIMEOUT_SECONDS:-600}
+    ports:
+      - "${ROUTER_PORT:-9000}:9000"
+    depends_on:
+      - vllm-openbio
+    restart: unless-stopped
+
+  # Reviewer / biomedical model: OpenBioLLM-70B (fp8) on GPU ${OPENBIO_GPUS}. Always-on with
+  # sleep mode; llm-router toggles /sleep <-> /wake_up (VLLM_SERVER_DEV_MODE exposes those).
+  vllm-openbio:
+    image: vllm/vllm-openai:${VLLM_TAG:-latest}
+    container_name: ipsa-vllm-openbio
+    runtime: nvidia
+    ipc: host
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=${OPENBIO_GPUS:-0}
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
+      - VLLM_SERVER_DEV_MODE=1
+    volumes:
+      - ${HF_CACHE:-/data/ipsa/llm/hf-cache}:/root/.cache/huggingface
+    command: >
+      --model aaditya/Llama3-OpenBioLLM-70B
+      --quantization fp8
+      --kv-cache-dtype fp8
+      --no-enable-prefix-caching
+      --max-num-batched-tokens 8192
+      --enable-sleep-mode
+      --tensor-parallel-size ${OPENBIO_TP:-1}
+      --gpu-memory-utilization ${OPENBIO_MEM_UTIL:-0.90}
+      --host 0.0.0.0 --port 8002
+    restart: unless-stopped
+
+  # OPTIONAL main reasoning model: gpt-oss-120b on GPU ${GPTOSS_GPUS}.
+  #
+  # Not started by default. Enable it when you have no OpenAI-compatible endpoint of your
+  # own and want this stack to serve one:
+  #
+  #   docker compose -f docker-compose.prod.yml --profile local-gptoss up -d
+  #
+  # Then point pipeline-api at it in .env:
+  #   GPTOSS_API_URL=http://vllm-gptoss:8001/v1/chat/completions
+  #   GPTOSS_MODEL=openai/gpt-oss-120b
+  #
+  # Needs a GPU of its own — GPTOSS_GPUS must not overlap OPENBIO_GPUS. Note this model
+  # is NOT behind llm-router, so it is not slept when idle and holds its GPU while up.
+  vllm-gptoss:
+    profiles: ["local-gptoss"]
+    image: vllm/vllm-openai:${VLLM_TAG:-latest}
+    container_name: ipsa-vllm-gptoss
+    runtime: nvidia
+    ipc: host
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=${GPTOSS_GPUS:-1}
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
+      - VLLM_SERVER_DEV_MODE=1
+    volumes:
+      - ${HF_CACHE:-/data/ipsa/llm/hf-cache}:/root/.cache/huggingface
+    ports:
+      - "${GPTOSS_PORT:-8001}:8001"
+    command: >
+      --model openai/gpt-oss-120b
+      --tool-call-parser openai
+      --enable-auto-tool-choice
+      --enable-sleep-mode
+      --tensor-parallel-size ${GPTOSS_TP:-1}
+      --gpu-memory-utilization ${GPTOSS_MEM_UTIL:-0.90}
+      --host 0.0.0.0 --port 8001
+    restart: unless-stopped

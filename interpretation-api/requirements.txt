@@ -1,0 +1,18 @@
+# Minimal deps for the 5-step LLM interpretation pipeline (FastAPI service).
+# The pipeline talks to OpenAI-compatible endpoints over plain HTTP, so no vendor LLM
+# SDK is required — everything below is the web framework, the HTTP client, or an
+# analysis dependency.
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+pydantic==2.5.0
+pydantic-settings==2.1.0
+python-dotenv==1.0.0
+requests==2.31.0
+xmltodict==0.13.0
+networkx>=3.0
+# Graph clustering for Step-1 pathway themes: Markov Clustering (van Dongen 2000),
+# the aPEAR default / EnrichmentMap-recommended algorithm. numpy+scipy are its runtime
+# deps (used only inside the clustering service). Published as pre-release dev builds.
+markov_clustering==0.0.6.dev0
+numpy>=1.24
+scipy>=1.10

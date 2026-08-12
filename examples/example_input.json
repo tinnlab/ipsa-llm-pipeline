@@ -1,0 +1,60 @@
+{
+  "metadata": {
+    "disease": "Hepatocellular carcinoma",
+    "tissue": "Liver",
+    "organism": "Homo sapiens",
+    "description": "Tumour vs adjacent normal liver, small illustrative subset"
+  },
+  "genes": [
+    {"geneSymbol": "CDK1",   "foldChange":  3.10, "pValue": 0.0000021, "pValueFDR": 0.000045},
+    {"geneSymbol": "CCNB1",  "foldChange":  2.85, "pValue": 0.0000090, "pValueFDR": 0.000120},
+    {"geneSymbol": "TOP2A",  "foldChange":  2.64, "pValue": 0.0000310, "pValueFDR": 0.000310},
+    {"geneSymbol": "MKI67",  "foldChange":  2.20, "pValue": 0.0001200, "pValueFDR": 0.000900},
+    {"geneSymbol": "BUB1",   "foldChange":  1.95, "pValue": 0.0004500, "pValueFDR": 0.002700},
+    {"geneSymbol": "ACADS",  "foldChange": -2.40, "pValue": 0.0000150, "pValueFDR": 0.000190},
+    {"geneSymbol": "ACAT1",  "foldChange": -2.15, "pValue": 0.0000620, "pValueFDR": 0.000540},
+    {"geneSymbol": "HADHA",  "foldChange": -1.98, "pValue": 0.0002100, "pValueFDR": 0.001500},
+    {"geneSymbol": "CPT1A",  "foldChange": -1.76, "pValue": 0.0008300, "pValueFDR": 0.004400},
+    {"geneSymbol": "ACOX1",  "foldChange": -1.62, "pValue": 0.0015000, "pValueFDR": 0.007100},
+    {"geneSymbol": "PPARA",  "foldChange": -1.45, "pValue": 0.0031000, "pValueFDR": 0.012000},
+    {"geneSymbol": "HNF4A",  "foldChange": -1.30, "pValue": 0.0067000, "pValueFDR": 0.021000}
+  ],
+  "pathways": [
+    {
+      "name": "Cell cycle",
+      "source": "KEGG",
+      "pathwayId": "hsa04110",
+      "pValue": 0.0000042,
+      "pValueFDR": 0.00019,
+      "NES": 2.41,
+      "genes": ["CDK1", "CCNB1", "TOP2A", "MKI67", "BUB1"]
+    },
+    {
+      "name": "Fatty acid degradation",
+      "source": "KEGG",
+      "pathwayId": "hsa00071",
+      "pValue": 0.0000180,
+      "pValueFDR": 0.00041,
+      "NES": -2.28,
+      "genes": ["ACADS", "ACAT1", "HADHA", "CPT1A", "ACOX1"]
+    },
+    {
+      "name": "PPAR signaling pathway",
+      "source": "KEGG",
+      "pathwayId": "hsa03320",
+      "pValue": 0.0002400,
+      "pValueFDR": 0.00310,
+      "NES": -1.94,
+      "genes": ["PPARA", "CPT1A", "ACOX1", "HADHA"]
+    },
+    {
+      "name": "Butanoate metabolism",
+      "source": "KEGG",
+      "pathwayId": "hsa00650",
+      "pValue": 0.0011000,
+      "pValueFDR": 0.00920,
+      "NES": -1.71,
+      "genes": ["ACADS", "ACAT1", "HADHA"]
+    }
+  ]
+}

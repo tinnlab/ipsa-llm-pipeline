@@ -1,0 +1,18 @@
+# Keep dev/test artifacts out of the production image (the app doesn't run tests).
+tests/
+requirements-dev.txt
+__pycache__/
+**/__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.env
+# Never bake local run artifacts into the image: job outputs contain real input data
+# and generated reports, and cache/ holds service HTTP caches. Both are recreated at
+# runtime by the Dockerfile.
+output/
+cache/
+*.log
+venv/
+.venv/

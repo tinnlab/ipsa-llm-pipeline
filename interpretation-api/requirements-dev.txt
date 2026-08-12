@@ -1,0 +1,8 @@
+# Test-only dependencies. Tests mock all LLM/network calls — no model or GPU needed.
+#   pip install -r requirements.txt -r requirements-dev.txt
+#   python -m pytest tests/ -v
+pytest>=7.4
+pytest-mock>=3.12
+# Required by fastapi.testclient (starlette's TestClient is built on httpx).
+# Capped below 0.28, which removed the `app=` shortcut this starlette version relies on.
+httpx>=0.24,<0.28

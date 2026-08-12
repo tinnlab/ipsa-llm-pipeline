@@ -1,0 +1,117 @@
+IPSA LLM Pipeline
+Copyright (c) 2026 Tin Nguyen Lab
+
+This product includes software developed by the Tin Nguyen Lab, licensed under
+the MIT License (see LICENSE).
+
+The source code in this repository is MIT-licensed. It is, however, designed to
+run models and query databases that carry their own, different terms. Those
+components are NOT covered by this repository's licence, and none of them is
+redistributed here. What follows is what you should be aware of before using
+this software, particularly for commercial purposes.
+
+
+-------------------------------------------------------------------------------
+MODELS THIS STACK DEPLOYS
+-------------------------------------------------------------------------------
+
+Llama3-OpenBioLLM-70B (aaditya/Llama3-OpenBioLLM-70B)
+    The reviewer model. Weights are downloaded from Hugging Face at runtime and
+    are not distributed with this repository. It is a derivative of Meta's
+    Llama 3 and is governed by the META LLAMA 3 COMMUNITY LICENSE AGREEMENT,
+    which is not an OSI-approved open-source licence. Among other terms it
+    carries an acceptable-use policy, a condition on services exceeding 700
+    million monthly active users, and a requirement to display
+
+        "Built with Meta Llama 3"
+
+    Review the model card and the Meta Llama 3 licence before deploying it.
+
+gpt-oss-120b (openai/gpt-oss-120b)
+    The reasoning model, served by the optional "local-gptoss" profile or by an
+    endpoint you provide. Released by OpenAI under the Apache License 2.0.
+    Weights are not distributed with this repository.
+
+OpenAI and Anthropic APIs  —  optional, disabled by default
+    The baseline-comparison feature (ENABLE_BASELINE_COMPARISON, default False) sends
+    the same input to the OpenAI and Anthropic APIs for side-by-side comparison. It is
+    off unless you enable it and supply API keys, and it is subject to those providers'
+    terms rather than this licence.
+
+vLLM (vllm/vllm-openai container image)
+    Serves both models. vLLM is licensed under the Apache License 2.0. The
+    published image additionally bundles NVIDIA CUDA components under NVIDIA's
+    own licence terms.
+
+
+-------------------------------------------------------------------------------
+DATA SOURCES
+-------------------------------------------------------------------------------
+
+CollecTRI / OmniPath  —  fetched by you, not shipped
+    The TF-target regulon used for upstream-regulator inference is NOT included
+    in this repository. interpretation-api/src/pipeline/data/README.md explains
+    how to obtain it. OmniPath aggregates resources under heterogeneous terms,
+    some restricted to academic use; review them for your use case. The pipeline
+    runs without this file and falls back to LLM-proposed candidates.
+        Muller-Dott et al., Nucleic Acids Research, 2023 (CollecTRI)
+        Turei et al., Molecular Systems Biology, 2021 (OmniPath)
+
+KEGG  —  queried at runtime (https://rest.kegg.jp)
+    Used for pathway structure (KGML) retrieval. KEGG is free for academic use
+    via its website, but programmatic, bulk, or commercial access requires a
+    licence from Pathway Solutions. If you deploy this commercially, resolve
+    KEGG licensing first.
+        Kanehisa & Goto, Nucleic Acids Research, 2000
+
+STRING  —  queried at runtime (https://string-db.org)
+    Protein-protein interaction networks for hub-gene analysis. Distributed
+    under CC BY 4.0, which requires attribution.
+        Szklarczyk et al., Nucleic Acids Research
+
+Reactome  —  queried at runtime (https://reactome.org)
+    Pathway structure. Released under CC0.
+        Milacic et al., Nucleic Acids Research
+
+Pathway Commons  —  queried at runtime (https://www.pathwaycommons.org)
+    Interaction evidence. Aggregates sources with per-source terms.
+        Rodchenkov et al., Nucleic Acids Research
+
+
+-------------------------------------------------------------------------------
+ALGORITHMS REIMPLEMENTED (no third-party code copied)
+-------------------------------------------------------------------------------
+
+Markov Clustering
+    Step 1 groups pathways into themes using MCL.
+        van Dongen, "Graph Clustering by Flow Simulation", PhD thesis,
+        University of Utrecht, 2000
+    Implemented via the markov_clustering package (MIT).
+
+aPEAR default parameters
+    The clustering parameters in
+    interpretation-api/src/pipeline/services/pathway_clustering_service.py
+    mirror the published defaults of aPEAR (ievaKer/aPEAR). The parameter
+    choices were read from that project's documentation; no code was copied.
+        Kersevicius & Gordevicius, Bioinformatics, 2023
+
+
+-------------------------------------------------------------------------------
+PYTHON DEPENDENCIES
+-------------------------------------------------------------------------------
+
+Declared dependencies are permissively licensed. Those imposing attribution or
+file-level source obligations, and therefore worth noting if you redistribute a
+built image:
+
+    requests            Apache License 2.0
+    pytest-asyncio      Apache License 2.0   (development only)
+    certifi             Mozilla Public License 2.0  (pulled in transitively)
+
+The remainder are MIT or BSD-3-Clause: fastapi, pydantic, pydantic-settings,
+xmltodict, markov_clustering, pytest, pytest-mock (MIT); uvicorn, httpx,
+respx, networkx, numpy, scipy, python-dotenv (BSD-3-Clause).
+
+Container images are built FROM python:3.11-slim, whose Debian userland
+includes GPL- and LGPL-licensed system libraries. This matters only if you
+redistribute the images themselves rather than this source.
