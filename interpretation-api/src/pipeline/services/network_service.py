@@ -125,12 +125,6 @@ class NetworkAnalysisService:
                           gene_data.get('log2FoldChange') or 0)
             p_value = gene_data.get('pValue') or gene_data.get('p_value') or 1.0
 
-            # Apply tissue-marker penalty for likely differentiation markers (Fix 2)
-            tissue_penalty = self._compute_tissue_marker_penalty(gene_name, fold_change, context)
-            if tissue_penalty > 0:
-                hub_score = max(0.0, hub_score - tissue_penalty)
-                logger.info(f'  Tissue-marker penalty for {gene_name}: -{tissue_penalty:.2f} (FC={fold_change:+.2f})')
-
             # Peripheral-node demotion (Fix 6): genes with degree=1, betweenness=0,
             # and modest fold change are likely noise — demote significantly
             if (scores['degree'] <= 1 and scores['betweenness'] == 0
@@ -490,55 +484,6 @@ class NetworkAnalysisService:
 
         hub_genes.sort(key=lambda x: x.hub_score, reverse=True)
         return hub_genes[:top_n]
-
-    def _compute_tissue_marker_penalty(
-        self,
-        gene_name: str,
-        fold_change: float,
-        context: Optional[Dict]
-    ) -> float:
-        """
-        Compute a penalty for genes that are likely tissue-specific differentiation
-        markers rather than disease drivers.
-
-        Heuristic: genes that are downregulated (lost during dedifferentiation) AND
-        belong to tissue-specific functional categories (ion channels, tight junctions,
-        transporters) are likely passenger genes, not drivers.
-
-        Args:
-            gene_name: Gene symbol
-            fold_change: log2 fold change (negative = downregulated)
-            context: Disease/tissue context dict
-
-        Returns:
-            Penalty value (0.0 = no penalty, 0.3 = likely tissue marker)
-        """
-        if not context or fold_change >= -1.0:
-            return 0.0
-
-        # Tissue-specific gene family prefixes/patterns associated with
-        # normal tissue homeostasis rather than disease driving
-        TISSUE_MARKER_GENES = {
-            # Ion channels (kidney-specific)
-            'KCNJ', 'KCNK', 'SCNN', 'CLCN', 'TRPV', 'TRPM',
-            # Tight junctions
-            'CLDN', 'TJP', 'OCLN', 'CGN',
-            # Solute carriers / transporters
-            'SLC', 'ATP6V', 'ATP12A', 'AQP',
-            # Kinases involved in ion homeostasis
-            'WNK',
-            # Hormones with no tissue-relevant function
-            'GNRH',
-        }
-
-        # Check if gene matches any tissue-marker pattern
-        gene_upper = gene_name.upper()
-        is_tissue_marker = any(gene_upper.startswith(prefix) for prefix in TISSUE_MARKER_GENES)
-
-        if is_tissue_marker:
-            return 0.3
-
-        return 0.0
 
 
 # Species mapping
