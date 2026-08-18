@@ -256,9 +256,9 @@ Return ONLY valid JSON in this format:
             "messages": [
                 {"role": "user", "content": prompt}
             ],
-            "temperature": 0,
+            # "temperature": 0,
             "max_completion_tokens": 8000,
-            "seed": 42
+            # "seed": 42
         }
 
         response = requests.post(
@@ -283,7 +283,7 @@ Return ONLY valid JSON in this format:
         payload = {
             "model": self.model,
             "max_tokens": 16000,
-            "temperature": 0,
+            # "temperature": 0,
             "messages": [
                 {"role": "user", "content": prompt}
             ]

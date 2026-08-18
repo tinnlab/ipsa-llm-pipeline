@@ -121,17 +121,16 @@ class UnifiedLLMClient:
         payload = {
             "model": self.model,
             "messages": messages,
-            "temperature": temperature if temperature is not None else self.temperature,
+            # "temperature": temperature if temperature is not None else self.temperature,
         }
 
-        # Add seed parameter if provided (for deterministic outputs)
-        if seed is not None:
-            payload["seed"] = seed
-            if self.provider != "reviewer":
-                payload["top_k"] = -1  # -1 = consider all tokens (valid for vLLM)
-                payload["repetition_penalty"] = 1.0
-                payload["frequency_penalty"] = 0.0
-                payload["presence_penalty"] = 0.0
+        # if seed is not None:
+        #     payload["seed"] = seed
+        #     if self.provider != "reviewer":
+        #         payload["top_k"] = -1  # -1 = consider all tokens (valid for vLLM)
+        #         payload["repetition_penalty"] = 1.0
+        #         payload["frequency_penalty"] = 0.0
+        #         payload["presence_penalty"] = 0.0
 
         # Add max_tokens (handle different parameter names)
         if self.provider == "groq":
@@ -318,19 +317,18 @@ class UnifiedLLMClient:
         payload = {
             "model": self.model,
             "messages": messages,
-            "temperature": temperature if temperature is not None else self.temperature,
+            # "temperature": temperature if temperature is not None else self.temperature,
             "tools": tools,
             "tool_choice": tool_choice
         }
 
-        # Add seed parameter if provided
-        if seed is not None:
-            payload["seed"] = seed
-            if self.provider != "reviewer":
-                payload["top_k"] = -1  # -1 = consider all tokens (valid for vLLM)
-                payload["repetition_penalty"] = 1.0
-                payload["frequency_penalty"] = 0.0
-                payload["presence_penalty"] = 0.0
+        # if seed is not None:
+        #     payload["seed"] = seed
+        #     if self.provider != "reviewer":
+        #         payload["top_k"] = -1  # -1 = consider all tokens (valid for vLLM)
+        #         payload["repetition_penalty"] = 1.0
+        #         payload["frequency_penalty"] = 0.0
+        #         payload["presence_penalty"] = 0.0
 
         # Add max_tokens (handle different parameter names)
         if self.provider == "groq":
