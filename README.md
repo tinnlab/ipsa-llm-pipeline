@@ -474,9 +474,14 @@ gates, pre-warming, GPU allocation and rolling image versions.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+AGPL-3.0-or-later — see [LICENSE](LICENSE).
 
-The **code** in this repository is MIT-licensed, but it runs models and queries databases
+This is free software under the GNU Affero General Public License, version 3 or any
+later version. It is meant to be run as a network service, so section 13 applies: if
+you modify it and let others use it over a network, you must offer them the source of
+your modified version.
+
+The **code** in this repository is AGPL-licensed, but it runs models and queries databases
 that carry their own terms, and those are not covered by it. In particular OpenBioLLM is a
 Llama 3 derivative under Meta's community licence, and KEGG requires a licence for
 programmatic or commercial use. See [NOTICE](NOTICE) before deploying commercially.

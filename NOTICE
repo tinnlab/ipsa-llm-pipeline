@@ -1,11 +1,25 @@
 IPSA LLM Pipeline
 Copyright (c) 2026 Tin Nguyen Lab
 
-This product includes software developed by the Tin Nguyen Lab, licensed under
-the MIT License (see LICENSE).
+This product includes software developed by the Tin Nguyen Lab.
 
-The source code in this repository is MIT-licensed. It is, however, designed to
-run models and query databases that carry their own, different terms. Those
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU Affero General Public License as published by the Free
+Software Foundation, either version 3 of the License, or (at your option) any
+later version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE. See the GNU Affero General Public License for more details.
+You should have received a copy of that licence along with this program (see
+LICENSE); if not, see <https://www.gnu.org/licenses/>.
+
+Because this pipeline is normally operated as a network service, note section
+13 of the AGPL: if you modify it and make it available to users over a network,
+you must offer those users the Corresponding Source of your modified version.
+
+The source code in this repository is AGPL-licensed. It is, however, designed
+to run models and query databases that carry their own, different terms. Those
 components are NOT covered by this repository's licence, and none of them is
 redistributed here. What follows is what you should be aware of before using
 this software, particularly for commercial purposes.
