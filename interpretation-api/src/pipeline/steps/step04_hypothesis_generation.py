@@ -85,6 +85,39 @@ class Hypothesis:
     novelty: str
 
 
+# Canonical novelty labels the prompt asks for. "extended" replaced the earlier
+# "builds-on-known"; the model may still emit the old phrase (or a spelling variant),
+# so it is mapped here rather than trusted to the prompt alone.
+NOVELTY_LABELS = ('novel', 'extended', 'confirmatory')
+_LEGACY_NOVELTY_ALIASES = {
+    'builds-on-known': 'extended',
+    'builds-on-known-biology': 'extended',
+    'builds-on': 'extended',
+    'extends-known': 'extended',
+    'extends': 'extended',
+    'extension': 'extended',
+}
+
+
+def normalize_novelty(value: Any) -> str:
+    """Map an LLM-returned novelty label onto the canonical vocabulary.
+
+    Never raises: callers interpolate the result straight into report markdown.
+    Canonical labels and known legacy aliases are returned in canonical form;
+    any other non-empty string is returned stripped but otherwise unchanged;
+    empty, ``None`` and non-string values become ``'unknown'``.
+    """
+    if not isinstance(value, str):
+        return 'unknown'
+    stripped = value.strip()
+    if not stripped:
+        return 'unknown'
+    key = re.sub(r'[\s_]+', '-', stripped.lower())
+    if key in NOVELTY_LABELS:
+        return key
+    return _LEGACY_NOVELTY_ALIASES.get(key, stripped)
+
+
 @dataclass
 class HypothesisResult:
     """Result of hypothesis generation"""
@@ -803,6 +836,11 @@ class Step04HypothesisGeneration:
             gene_fc = gene_fc_lookup(genes)
             fc_conflicts = self._correct_fold_change_citations(result, gene_fc, seed)
 
+            # Canonicalise novelty labels in the stored hypotheses (not just the rendered
+            # markdown) so every downstream reader — report_section, Step 6, meta-analysis —
+            # sees the same vocabulary regardless of what the model emitted.
+            self._canonicalize_novelty_labels(result)
+
             # Generate report section
             report_section = self._generate_report_section(result, experiment_context)
 
@@ -1492,7 +1530,7 @@ RESPONSE FORMAT:
             prompt_parts.append('Build hypotheses that ADD MECHANISTIC DETAIL to known biology — specify '
                                'which genes/steps are responsible, rather than claiming the overall process is novel.\n')
             prompt_parts.append('If a process (e.g., immune infiltration in KIRC) is well-established, '
-                               'label it "builds-on-known" and focus on what your data adds.\n\n')
+                               'label it "extended" and focus on what your data adds.\n\n')
 
         # Add pathway themes from Step 1
         if themes:
@@ -1972,8 +2010,8 @@ RESPONSE FORMAT:
         prompt_parts.append('      "directionalPrediction": "Directional prediction grounded in data (e.g., \'Inhibiting GENE_X [↑FC] should reduce downstream pathway Z activation\')",\n')
         prompt_parts.append('      "confidence": "high" | "medium" | "low",\n')
         prompt_parts.append('      "confidenceRationale": "Why this confidence level (cite specific evidence)",\n')
-        prompt_parts.append('      "novelty": "novel | builds-on-known | confirmatory",'
-                           ' // novel = mechanism not in literature; builds-on-known = adds detail to established biology;'
+        prompt_parts.append('      "novelty": "novel | extended | confirmatory",'
+                           ' // novel = mechanism not in literature; extended = adds detail to established biology;'
                            ' confirmatory = data confirms known mechanism\n')
         prompt_parts.append('      "cellularContext": "Which cell type(s) each gene is expressed in (e.g., \'Tumor-intrinsic genes: tumor cells; IFNG, GZMB: infiltrating immune cells; secreted factors: specify source cell type\')",\n')
         prompt_parts.append('      "mechanisticClaims": [\n')
@@ -2000,6 +2038,14 @@ RESPONSE FORMAT:
         prompt_parts.append('- Address DISTINCT biological mechanisms — no two hypotheses should focus on the same pathway or process\n')
 
         return ''.join(prompt_parts)
+
+    @staticmethod
+    def _canonicalize_novelty_labels(result: Dict) -> None:
+        """Rewrite each hypothesis's ``novelty`` in place via :func:`normalize_novelty`.
+        Hypotheses without a ``novelty`` key are left without one."""
+        for hyp in result.get('hypotheses', []) or []:
+            if isinstance(hyp, dict) and 'novelty' in hyp:
+                hyp['novelty'] = normalize_novelty(hyp['novelty'])
 
     def _generate_report_section(self, result: Dict, experiment_context: str) -> str:
         """Generate markdown report section"""
@@ -2028,7 +2074,7 @@ RESPONSE FORMAT:
 
                 # Confidence and novelty
                 confidence = hyp.get('confidence', 'unknown')
-                novelty = hyp.get('novelty', 'unknown')
+                novelty = normalize_novelty(hyp.get('novelty'))
                 lines.append(f'*Confidence: {confidence.upper()} | Novelty: {novelty}*\n\n')
 
                 # Mechanistic model

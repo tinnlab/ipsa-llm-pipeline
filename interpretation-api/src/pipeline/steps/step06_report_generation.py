@@ -32,6 +32,7 @@ from src.pipeline.fc_utils import fc_arrow, fc_direction, to_float
 # Reuse the NES-preferred extraction so the report labels each value with its actual
 # metric ('NES'/'ES') on the same scale as the Step 3 detailed sections.
 from src.pipeline.steps.step03_pathway_mechanisms import _enrichment_metric
+from src.pipeline.steps.step04_hypothesis_generation import normalize_novelty
 
 
 @dataclass
@@ -697,7 +698,7 @@ Keep it factual and grounded in these specific findings."""
             for i, hyp in enumerate(hypotheses, 1):
                 statement = hyp.get('hypothesis', 'N/A')
                 confidence = hyp.get('confidence', 'unknown').upper()
-                novelty = hyp.get('novelty', 'unknown')
+                novelty = normalize_novelty(hyp.get('novelty'))
                 model = hyp.get('mechanisticModel', '')
                 key_players = hyp.get('keyPlayers', [])
                 evidence = hyp.get('evidenceSupporting', [])
