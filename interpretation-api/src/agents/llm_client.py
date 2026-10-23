@@ -7,6 +7,22 @@ from typing import Dict, List, Optional
 from ..config import settings
 
 
+class LLMIncompleteError(Exception):
+    """Raised by `chat(..., require_complete=True)` when the reply is not usable as final content."""
+
+
+class LLMTruncatedError(LLMIncompleteError):
+    """The reply stopped at the token limit (finish_reason == 'length'), even after one retry."""
+
+
+class LLMEmptyContentError(LLMIncompleteError):
+    """The reply carried no content. Reasoning text is never substituted for it."""
+
+
+# Ceiling for the single retry `require_complete` makes after a 'length' stop.
+REQUIRE_COMPLETE_MAX_TOKENS = 32768
+
+
 class UnifiedLLMClient:
     """Unified LLM client that supports multiple providers"""
 
@@ -59,7 +75,8 @@ class UnifiedLLMClient:
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
         stream: bool = False,
-        response_format: Optional[Dict] = None
+        response_format: Optional[Dict] = None,
+        require_complete: bool = False
     ) -> str:
         """
         Generate completion using configured LLM provider
@@ -72,6 +89,7 @@ class UnifiedLLMClient:
             stream: Enable streaming response
             response_format: Optional OpenAI-style response_format (e.g.
                 {"type": "json_object"}) to force structured output
+            require_complete: Opt-in; see `chat`.
 
         Returns:
             Generated text
@@ -89,6 +107,9 @@ class UnifiedLLMClient:
             "content": prompt
         })
 
+        if require_complete:
+            return self.chat(messages, temperature, max_tokens, stream,
+                              response_format=response_format, require_complete=True)
         return self.chat(messages, temperature, max_tokens, stream,
                           response_format=response_format)
 
@@ -99,7 +120,8 @@ class UnifiedLLMClient:
         max_tokens: Optional[int] = None,
         stream: bool = False,
         seed: Optional[int] = None,
-        response_format: Optional[Dict] = None
+        response_format: Optional[Dict] = None,
+        require_complete: bool = False
     ) -> str:
         """
         Chat completion using configured LLM provider
@@ -113,6 +135,14 @@ class UnifiedLLMClient:
             response_format: Optional OpenAI-style response_format (e.g.
                 {"type": "json_object"}) to force structured/JSON output.
                 Supported by vLLM's OpenAI server and Groq.
+            require_complete: Opt-in. When True, a reply that stops at the token
+                limit is retried once with double the budget and then raises
+                LLMTruncatedError, and a reply with no content raises
+                LLMEmptyContentError instead of falling back to reasoning text.
+                The default (False) leaves behaviour exactly as before. Callers
+                that pass True must catch LLMIncompleteError themselves: the
+                pipeline has a single try/except, so an escaping raise aborts
+                the whole run.
 
         Returns:
             Generated text
@@ -161,6 +191,9 @@ class UnifiedLLMClient:
         if self.provider == "groq" and self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
 
+        if require_complete:
+            return self._chat_require_complete(payload, headers, stream)
+
         try:
             response = requests.post(
                 self.api_url,
@@ -189,6 +222,47 @@ class UnifiedLLMClient:
 
         except requests.exceptions.RequestException as e:
             raise Exception(f"{self.provider.upper()} API error: {e}")
+
+    def _chat_require_complete(self, payload: Dict, headers: Dict, stream: bool) -> str:
+        """`chat` with require_complete=True: never return truncated or reasoning-only text."""
+        budget_key = 'max_completion_tokens' if 'max_completion_tokens' in payload else 'max_tokens'
+
+        for attempt in range(2):
+            try:
+                response = requests.post(
+                    self.api_url,
+                    headers=headers,
+                    json=payload,
+                    timeout=self.timeout,
+                    stream=stream
+                )
+                response.raise_for_status()
+            except requests.exceptions.RequestException as e:
+                raise Exception(f"{self.provider.upper()} API error: {e}")
+
+            if stream:
+                content, finish_reason = self._read_stream(response)
+            else:
+                data = response.json()
+                self._track_usage(data)
+                choice = data['choices'][0]
+                content = choice['message'].get('content')
+                finish_reason = choice.get('finish_reason')
+
+            if finish_reason == 'length':
+                budget = payload.get(budget_key) or self.max_tokens
+                if attempt == 0 and budget < REQUIRE_COMPLETE_MAX_TOKENS:
+                    payload = {**payload, budget_key: min(budget * 2, REQUIRE_COMPLETE_MAX_TOKENS)}
+                    continue
+                raise LLMTruncatedError(
+                    f"LLM reply stopped at the token limit ({budget_key}={budget})"
+                )
+            if content is None or not content.strip():
+                raise LLMEmptyContentError(
+                    f"LLM reply had no content (finish_reason={finish_reason!r})"
+                )
+            return content
+        raise LLMTruncatedError('LLM reply stopped at the token limit')  # unreachable
 
     def _ensure_tool_message_names(self, messages: List[Dict]) -> List[Dict]:
         """Ensure all tool role messages have a 'name' field.
@@ -402,7 +476,12 @@ class UnifiedLLMClient:
 
     def _handle_stream(self, response):
         """Handle streaming response"""
+        return self._read_stream(response)[0]
+
+    def _read_stream(self, response):
+        """Read a streaming response; returns (content, finish_reason of the last choice that set one)."""
         full_content = ""
+        finish_reason = None
 
         for line in response.iter_lines():
             if line:
@@ -415,14 +494,17 @@ class UnifiedLLMClient:
 
                     try:
                         data = json.loads(data_str)
-                        delta = data['choices'][0].get('delta', {})
+                        choice = data['choices'][0]
+                        delta = choice.get('delta', {})
                         content = delta.get('content', '')
                         if content:
                             full_content += content
+                        if choice.get('finish_reason'):
+                            finish_reason = choice['finish_reason']
                     except json.JSONDecodeError:
                         continue
 
-        return full_content
+        return full_content, finish_reason
 
     def _track_usage(self, data: Dict):
         """Track token usage from API response"""

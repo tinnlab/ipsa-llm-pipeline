@@ -381,8 +381,13 @@ class MetaPipelineOrchestrator:
             if field not in output:
                 logger.warning(f"Step 9 output missing field: {field}")
 
+        # Fields step 9 deliberately no longer generates: empty by design, not a bug.
+        gated = set((output.get('summary') or {}).get('gated_fields') or [])
+        if gated:
+            logger.info(f"Step 9 fields gated by design (not generated): {sorted(gated)}")
+
         interpretation = output.get('biological_interpretation', '')
-        if not interpretation or not interpretation.strip():
+        if 'biological_interpretation' not in gated and (not interpretation or not interpretation.strip()):
             logger.warning("Step 9 biological_interpretation is empty")
 
         warnings = output.get('warnings', [])
