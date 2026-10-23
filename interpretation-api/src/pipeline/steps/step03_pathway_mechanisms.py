@@ -320,7 +320,9 @@ class Step03PathwayMechanisms:
             print('  ⚠️  No pathway structures retrieved. Cannot proceed with mechanism analysis.')
             return PathwayMechanismResult(
                 pathway_mechanisms=[],
-                mechanistic_summary='No pathway structures could be retrieved from KEGG.',
+                # Retrieval covers KEGG, Pathway Commons and LLM inference, so naming KEGG was wrong.
+                # mechanistic_summary='No pathway structures could be retrieved from KEGG.',
+                mechanistic_summary='No pathway structures could be retrieved.',
                 pathway_structures=[],
                 pathway_overlaps=[asdict(o) for o in pathway_overlaps],
                 report_section=self._generate_empty_report()
@@ -2015,7 +2017,8 @@ Return JSON:
 
     def _generate_empty_report(self) -> str:
         """Generate empty report when no pathways found"""
+        # Was "...retrieved from KEGG for analysis." — retrieval is not KEGG-only.
         return '''## Pathway Mechanisms and Interactions
 
-No pathway structures could be retrieved from KEGG for analysis.
+No pathway structures could be retrieved for analysis.
 '''

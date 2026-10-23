@@ -35,6 +35,42 @@ from src.pipeline.steps.step03_pathway_mechanisms import _enrichment_metric
 from src.pipeline.steps.step04_hypothesis_generation import normalize_novelty
 
 
+def _pathway_databases(input_data: Dict) -> List[str]:
+    """The pathway databases the submitted pathways came from (each pathway's `source`),
+    in first-seen order, with empty/'Unknown' values dropped."""
+    seen = []
+    for pathway in (input_data or {}).get('pathways', []) or []:
+        name = str((pathway or {}).get('source') or '').strip()
+        if name and name.lower() != 'unknown' and name not in seen:
+            seen.append(name)
+    return seen
+
+
+def _step3_methods_text(step3: Dict) -> str:
+    """Methods line for Step 3, built from the evidence its pathway structures actually had."""
+    if (step3 or {}).get('metadata', {}).get('skipped', False):
+        return 'Skipped (no gene expression data)'
+    curated, kinds = [], []
+    for ps in (step3 or {}).get('pathway_structures', []) or []:
+        confidence = ps.get('confidence')
+        if confidence == 'high':
+            name = f"curated {str(ps.get('source') or '').upper()} pathway structures".replace('  ', ' ')
+            if name not in curated:
+                curated.append(name)
+        else:
+            label = {
+                'pc_grounded': 'Pathway Commons interactions',
+                'inferred': 'LLM-inferred relations',
+                'gene_set': 'pathway gene-set membership',
+            }.get(confidence)
+            if label and label not in kinds:
+                kinds.append(label)
+    evidence = curated + kinds
+    if not evidence:
+        return 'Pathway mechanism analysis'
+    return f"Pathway mechanism analysis ({'; '.join(evidence)})"
+
+
 @dataclass
 class ReportSection:
     """A section of the final report"""
@@ -561,7 +597,9 @@ Keep it factual and grounded in these specific findings."""
             if mechanistic_summary:
                 content += f"{mechanistic_summary}\n\n"
 
-            content += f"Mechanistic analysis identified **{len(pathway_mechanisms)}** pathway mechanisms with curated regulatory relations.\n\n"
+            # Relations can be curated, Pathway Commons-grounded or LLM-inferred, so "curated" overclaimed.
+            # content += f"Mechanistic analysis identified **{len(pathway_mechanisms)}** pathway mechanisms with curated regulatory relations.\n\n"
+            content += f"Mechanistic analysis identified **{len(pathway_mechanisms)}** pathway mechanisms with regulatory relations.\n\n"
 
             # Show top pathways
             content += "### Key Pathway Mechanisms\n\n"
@@ -852,12 +890,18 @@ Keep it factual and grounded in these specific findings."""
         else:
             content += "- **Step 2:** Skipped (no gene expression data)\n"
 
-        content += "- **Step 3:** KEGG/Reactome pathway structure retrieval\n"
+        # Steps 3 and B used to state KEGG/Reactome for every report, including custom gene
+        # sets (e.g. MitoPathways) — a false provenance claim in the Methods. They now name
+        # what was actually used.
+        # content += "- **Step 3:** KEGG/Reactome pathway structure retrieval\n"
+        content += f"- **Step 3:** {_step3_methods_text(step3)}\n"
         content += "- **Step 4:** LLM-based hypothesis generation\n"
         content += "- **Step 5:** Final report generation\n\n"
 
         content += "### B. Data Sources\n\n"
-        content += "- **Pathway database:** KEGG/Reactome\n"
+        # content += "- **Pathway database:** KEGG/Reactome\n"
+        databases = _pathway_databases(input_data)
+        content += f"- **Pathway database:** {', '.join(databases) if databases else 'not specified in the input'}\n"
 
         if not step2_skipped:
             content += "- **PPI database:** STRING v11.5\n"

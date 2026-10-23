@@ -10,6 +10,11 @@ from src.pipeline.steps.step03_pathway_mechanisms import (
     Step03PathwayMechanisms,
     _relations_heading,
 )
+from src.pipeline.steps.step06_report_generation import (
+    Step06ReportGeneration,
+    _pathway_databases,
+    _step3_methods_text,
+)
 
 ORIGINAL_KEGG_INTRO = 'Interpret these curated KEGG pathway structures in light of differentially expressed genes:'
 
@@ -115,3 +120,62 @@ def test_mixed_batch_uses_source_neutral_wording():
     assert 'from KEGG structure' not in prompt
     assert 'citing KEGG relations' not in prompt
     assert '[CURATED]' in prompt  # the KEGG pathway is still shown as curated
+
+
+# ---- report-visible provenance strings outside the relation heading ----------------
+
+def test_empty_step3_report_does_not_name_kegg():
+    assert 'KEGG' not in _bare_step03()._generate_empty_report()
+
+
+def _bare_step06():
+    step = Step06ReportGeneration.__new__(Step06ReportGeneration)
+    step.llm = MagicMock()
+    return step
+
+
+def _appendix(pathways, step3):
+    section = _bare_step06()._generate_appendices(
+        input_data={'metadata': {'organism': 'Mus musculus'}, 'pathways': pathways},
+        step1={}, step2={'metadata': {'skipped': True}}, step3=step3, step4={})
+    return section.content
+
+
+def test_methods_name_the_custom_database_not_kegg():
+    content = _appendix(
+        [{'name': 'Complex I', 'source': 'MitoPathways'}, {'name': 'OXPHOS', 'source': 'MitoPathways'}],
+        {'pathway_structures': [{'source': 'other', 'confidence': 'inferred'},
+                                {'source': 'other', 'confidence': 'pc_grounded'}]})
+    assert '- **Pathway database:** MitoPathways\n' in content
+    assert ('- **Step 3:** Pathway mechanism analysis '
+            '(LLM-inferred relations; Pathway Commons interactions)') in content
+    assert 'KEGG' not in content and 'Reactome' not in content
+
+
+def test_methods_name_kegg_when_kegg_was_used():
+    content = _appendix([{'name': 'Cell cycle', 'source': 'KEGG'}],
+                        {'pathway_structures': [{'source': 'kegg', 'confidence': 'high'}]})
+    assert '- **Pathway database:** KEGG\n' in content
+    assert '(curated KEGG pathway structures)' in content
+
+
+def test_methods_fall_back_to_neutral_wording():
+    assert _pathway_databases({'pathways': [{'source': 'Unknown'}, {'source': ''}, {}]}) == []
+    content = _appendix([{'name': 'x', 'source': 'Unknown'}], {})
+    assert '- **Pathway database:** not specified in the input\n' in content
+    assert '- **Step 3:** Pathway mechanism analysis\n' in content
+
+
+def test_methods_lists_each_database_once_in_order():
+    assert _pathway_databases({'pathways': [{'source': 'GO_BP'}, {'source': 'KEGG'}, {'source': 'GO_BP'}]}) \
+        == ['GO_BP', 'KEGG']
+
+
+def test_methods_step3_skipped_without_genes():
+    assert _step3_methods_text({'metadata': {'skipped': True}}) == 'Skipped (no gene expression data)'
+
+
+def test_step6_mechanisms_fallback_does_not_claim_curated():
+    section = _bare_step06()._generate_mechanisms_section(
+        {'pathway_mechanisms': [{'pathway': 'P', 'curatedRelations': []}]})
+    assert 'curated' not in section.content.lower()
