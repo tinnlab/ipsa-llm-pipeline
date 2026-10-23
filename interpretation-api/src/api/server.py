@@ -293,9 +293,9 @@ async def submit_meta_pipeline_job(
     - Individual dataset data (each study separately)
 
     Then performs:
-    - Meta-Step 7: Reproducibility Analysis
-    - Meta-Step 9: Discovery Analysis
-    - Meta-Step 8: Comparative Report Generation
+    - Meta-Step 9: Discovery Analysis (progress step 6, Cross-Dataset Findings)
+    - Meta-Step 8: Comparative Report Generation (progress step 7, Final Report)
+    Meta-Step 7 (Reproducibility Analysis) is disabled; its output no longer reaches the report.
 
     Returns a job ID that can be used to check status and retrieve results.
     """
@@ -335,12 +335,14 @@ async def submit_meta_pipeline_job(
             meta_steps_info.append({"step": 2, "name": "Hub Genes", "message": "Detecting hub genes from combined data"})
             meta_steps_info.append({"step": 3, "name": "Pathway Mechanisms", "message": "Analyzing pathway mechanisms from combined data"})
         meta_steps_info.append({"step": 4, "name": "Hypothesis Generation", "message": "Generating mechanistic hypotheses from combined data"})
-        # Step 5 = the per-analysis report; the meta-only steps follow it.
+        # Step 5 = the per-analysis report; the meta-only steps follow it, numbered contiguously in
+        # execution order (must match the set_current_step ids in meta_orchestrator.execute).
         meta_steps_info.extend([
             {"step": 5, "name": "Analysis Report", "message": "Generating analysis report from combined data"},
-            {"step": 6, "name": "Reproducibility Analysis", "message": "Comparing results across datasets"},
-            {"step": 8, "name": "Discovery Analysis", "message": "Identifying meta-unique findings"},
-            {"step": 7, "name": "Comparative Report", "message": "Generating final comparative report"},
+            # Disabled: Reproducibility Analysis no longer runs, because its output no longer reaches the report.
+            # {"step": 6, "name": "Reproducibility Analysis", "message": "Comparing results across datasets"},
+            {"step": 6, "name": "Cross-Dataset Findings", "message": "Summarising findings across individual datasets"},
+            {"step": 7, "name": "Final Report", "message": "Assembling the final report"},
         ])
 
         # Create job with meta input as reference
