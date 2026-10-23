@@ -167,29 +167,33 @@ class MetaPipelineOrchestrator:
             if not meta_results.get('success', True):
                 raise Exception('Meta-analysis pipeline failed')
 
-            # Meta Step 6: Reproducibility Analysis
-            if job_id:
-                job_manager.set_current_step(job_id, 6, "Analyzing reproducibility across datasets")
-            print('\n' + '-' * 80)
-            print('PHASE 2: Reproducibility Analysis (Step 6)')
-            print('-' * 80)
+            # Meta-Step 7 (Reproducibility Analysis) is disabled: every consumer of its output in
+            # meta_step08 is commented out, so it ran, was validated and stored, and was never read.
+            # To re-enable, uncomment this block, restore the steps_info entry in server.py and
+            # renumber the progress ids below.
+            # if job_id:
+            #     job_manager.set_current_step(job_id, 6, "Analyzing reproducibility across datasets")
+            # print('\n' + '-' * 80)
+            # print('PHASE 2: Reproducibility Analysis (Step 6)')
+            # print('-' * 80)
+            #
+            # step7_start = time.time()
+            # reproducibility_results = self.step7.execute(
+            #     meta_results=meta_results,
+            #     dataset_results=dataset_results,
+            #     dataset_names=dataset_names
+            # )
+            # self._validate_step7_output(asdict(reproducibility_results))
+            # if job_id:
+            #     step7_time = time.time() - step7_start
+            #     job_manager.set_step_result(job_id, 6, asdict(reproducibility_results), step7_time)
+            reproducibility_results = {}  # step 8 still takes the parameter; the payload key stays
 
-            step7_start = time.time()
-            reproducibility_results = self.step7.execute(
-                meta_results=meta_results,
-                dataset_results=dataset_results,
-                dataset_names=dataset_names
-            )
-            self._validate_step7_output(asdict(reproducibility_results))
+            # Meta-Step 9: Discovery Analysis (progress step 6, Cross-Dataset Findings)
             if job_id:
-                step7_time = time.time() - step7_start
-                job_manager.set_step_result(job_id, 6, asdict(reproducibility_results), step7_time)
-
-            # Meta Step 8: Discovery Analysis — the main value of running a meta-analysis
-            if job_id:
-                job_manager.set_current_step(job_id, 8, "Identifying meta-unique discoveries")
+                job_manager.set_current_step(job_id, 6, "Summarising findings across individual datasets")
             print('\n' + '-' * 80)
-            print('PHASE 3: Meta-Analysis Discovery Analysis (Step 8)')
+            print('PHASE 2: Meta-Analysis Discovery Analysis (Step 6)')
             print('-' * 80)
 
             step9_start = time.time()
@@ -202,18 +206,18 @@ class MetaPipelineOrchestrator:
             self._validate_step9_output(asdict(discovery_results))
             if job_id:
                 step9_time = time.time() - step9_start
-                job_manager.set_step_result(job_id, 8, asdict(discovery_results), step9_time)
+                job_manager.set_step_result(job_id, 6, asdict(discovery_results), step9_time)
 
-            # Meta Step 7: Comparative Report
+            # Meta-Step 8: Comparative Report (progress step 7, Final Report)
             if job_id:
-                job_manager.set_current_step(job_id, 7, "Generating comparative report")
+                job_manager.set_current_step(job_id, 7, "Assembling the final report")
             print('\n' + '-' * 80)
-            print('PHASE 4: Comparative Report Generation (Step 7)')
+            print('PHASE 3: Final Report Assembly (Step 7)')
             print('-' * 80)
 
             step8_start = time.time()
             comparative_report = self.step8.execute(
-                reproducibility_results=asdict(reproducibility_results),
+                reproducibility_results=reproducibility_results,
                 discovery_results=asdict(discovery_results),
                 meta_results=meta_results,
                 dataset_results=dataset_results,
@@ -234,7 +238,7 @@ class MetaPipelineOrchestrator:
             return MetaPipelineResult(
                 meta_results=meta_results,
                 dataset_results=dataset_results,
-                reproducibility_results=asdict(reproducibility_results),
+                reproducibility_results=reproducibility_results,
                 discovery_results=asdict(discovery_results),
                 comparative_report=comparative_report,
                 execution_time=execution_time,
@@ -476,8 +480,9 @@ def main():
         print('\n' + '=' * 80)
         print('RESULTS SUMMARY')
         print('=' * 80)
-        print(f'\nMeta-unique pathways: {len(result.reproducibility_results["meta_unique_pathways"])}')
-        print(f'Meta-unique genes: {len(result.reproducibility_results["meta_unique_genes"])}')
+        # Reproducibility (Meta-Step 7) is disabled, so these are empty unless it is re-enabled.
+        print(f'\nMeta-unique pathways: {len(result.reproducibility_results.get("meta_unique_pathways", []))}')
+        print(f'Meta-unique genes: {len(result.reproducibility_results.get("meta_unique_genes", []))}')
         print(f'\nComparative report length: {len(result.comparative_report)} characters')
     else:
         print(f'\nMeta-pipeline failed: {result.error}')
