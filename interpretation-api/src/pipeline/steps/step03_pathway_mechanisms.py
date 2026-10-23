@@ -118,6 +118,22 @@ def _canonicalize_mechanism_names(mechanisms: List[Dict],
             mech['pathway'] = canon
 
 
+def _relations_heading(source: str, confidence: str) -> str:
+    """Report heading for a pathway's relation list, naming only the provenance it has.
+
+    Only 'high' confidence comes from a curated database structure (in practice KEGG).
+    PC-grounded relations come from Pathway Commons, inferred ones from the LLM, and a
+    gene-set-only or unmatched pathway has no relation provenance to claim at all.
+    """
+    if confidence == 'high':
+        return f'**{(source or "").upper()} Curated Regulatory Relations:**'
+    if confidence == 'pc_grounded':
+        return '**Pathway Commons Curated Interactions:**'
+    if confidence == 'inferred':
+        return '**Inferred Regulatory Relations (LLM-derived):**'
+    return '**Regulatory Relations:**'
+
+
 def _structures_missing_mechanisms(mechanisms: List[Dict],
                                    pathway_structures: List[Dict]) -> List[Dict]:
     """Structures with no mechanism entry, matched by id-stripped normalized name.
@@ -1203,9 +1219,19 @@ RESPONSE FORMAT:
         themes: Optional[List[Dict]] = None
     ) -> str:
         """Build user prompt for LLM with pathway data"""
-        prompt_parts = [
-            'Interpret these curated KEGG pathway structures in light of differentially expressed genes:\n\n'
-        ]
+        # The KEGG wording below asserts a KEGG structure is in the context and asks the model
+        # to cite it. That is only true when every pathway in the batch came from KEGG; for
+        # GO / Reactome / custom gene sets / PC / LLM fallbacks it invited fabricated "KEGG"
+        # claims. All-KEGG batches keep the original wording unchanged.
+        all_kegg = bool(pathway_structures) and all(
+            ps.get('source', 'kegg') == 'kegg' for ps in pathway_structures)
+        if all_kegg:
+            intro = 'Interpret these curated KEGG pathway structures in light of differentially expressed genes:\n\n'
+        else:
+            intro = ('Interpret these pathways in light of differentially expressed genes. Each pathway is '
+                     'marked with its evidence source ([CURATED], [PC-GROUNDED], [INFERRED] or [GENE-SET]); '
+                     'cite only the structure or relations actually shown for it:\n\n')
+        prompt_parts = [intro]
 
         # Add biological themes from Step 1 for context
         if themes:
@@ -1238,7 +1264,49 @@ RESPONSE FORMAT:
                 f'{overlap.shared_genes_count} shared DE genes{hub_genes_text}\n'
             )
 
-        # Add instructions
+        # Add instructions. `curatedRelations` keeps its name for every source (renaming it
+        # touches step 4, step 6, the validators and the orchestrator); provenance is carried
+        # by each pathway's source/confidence instead, and the report heading reads that.
+        if not all_kegg:
+            prompt_parts.append('''
+For each pathway, provide interpretation:
+1. **Biological function** - Summarize what this pathway does (from the structure or gene set provided)
+2. **DE gene involvement** - Which DE genes participate and their roles
+3. **Regulatory relationships** - Which provided relations involve DE genes (activation/inhibition); for [INFERRED] or [GENE-SET] pathways, include only well-established relationships and do not attribute them to a database
+4. **Crosstalk mechanisms** - How shared genes connect pathways (use overlap data)
+5. **Functional consequences** - What biological effects result from these gene changes
+
+Return JSON:
+{
+  "pathwayMechanisms": [
+    {
+      "pathway": "pathway name",
+      "biologicalFunction": "What it does (2-3 sentences)",
+      "deGeneInvolvement": [
+        {
+          "gene": "GENE_NAME",
+          "foldChange": FC_VALUE,
+          "roleInPathway": "What this gene does in the pathway (from the data provided)"
+        }
+      ],
+      "curatedRelations": [
+        {
+          "source": "GENE1",
+          "target": "GENE2",
+          "type": "activation/inhibition/phosphorylation",
+          "isDE": true/false,
+          "interpretation": "Functional consequence of this relation"
+        }
+      ],
+      "crosstalk": ["How this pathway connects to others via shared genes"],
+      "functionalConsequences": "Predicted biological outcomes (2-3 sentences)"
+    }
+  ],
+  "mechanisticSummary": "Overall interpretation citing the provided relations and DE gene patterns (4-5 sentences)"
+}
+''')
+            return ''.join(prompt_parts)
+
         prompt_parts.append('''
 For each pathway, provide interpretation:
 1. **Biological function** - Summarize what this pathway does (from KEGG structure)
@@ -1827,17 +1895,20 @@ Return JSON:
                     lines.append(f'- **{gene}**{fc_txt}{suffix}\n')
                 lines.append('\n')
 
-            # Curated relations
+            # Regulatory relations. The field is named curatedRelations for every source, so
+            # the heading is chosen from the pathway's actual provenance, not the field name.
             relations = mechanism.get('curatedRelations', [])
             if relations:
-                lines.append('**KEGG Curated Regulatory Relations:**\n\n')
+                # lines.append('**KEGG Curated Regulatory Relations:**\n\n')  # claimed KEGG for every source
+                lines.append(f'{_relations_heading(source, confidence)}\n\n')
                 for rel in relations:
-                    source = rel.get('source', '')
+                    # rel_source, not source: `source` is the pathway's database above.
+                    rel_source = rel.get('source', '')
                     target = rel.get('target', '')
                     rel_type = rel.get('type', '')
                     interp = (rel.get('interpretation') or '').strip()
                     suffix = f': {interp}' if interp else ''
-                    lines.append(f'- {source} --[{rel_type}]--> {target}{suffix}\n')
+                    lines.append(f'- {rel_source} --[{rel_type}]--> {target}{suffix}\n')
                 lines.append('\n')
 
             # Crosstalk mechanisms
