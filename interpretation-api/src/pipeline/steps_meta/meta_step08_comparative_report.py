@@ -795,7 +795,12 @@ class MetaStep08ComparativeReport:
                 pval = pw.get('best_pvalue', 1.0)
                 lines.append(f'| {name} | {count} | {pval:.2e} |')
 
-            lines.append('')
+            lines.extend([
+                '',
+                '*Not shown here: which datasets each pathway was found in, and its per-dataset '
+                'p-values and directions.*',
+                ''
+            ])
 
         # The former closing line ("The following sections show what meta-analysis
         # discovered BEYOND these individual findings.") is gone: the sections that follow

@@ -160,6 +160,7 @@ def test_meta_section_renamed_and_no_beyond_or_studies():
 def test_top_pathways_table_labels_cap():
     report = _run(_step6_markdown(with_genes=False))
     assert 'Showing top 15 of 30 pathways' in report
+    assert 'Not shown here: which datasets each pathway was found in' in report
 
 
 def test_meta_facts_line_in_executive_summary():
