@@ -23,6 +23,7 @@ from collections import defaultdict
 sys.path.append(str(Path(__file__).parent.parent.parent))
 
 from src.agents.groq_client import GroqClient
+from src.agents.llm_client import LLMIncompleteError
 
 logger = logging.getLogger(__name__)
 
@@ -140,6 +141,15 @@ class MetaStep09DiscoveryAnalysis:
     Identifies unique biological insights that only emerge from meta-analysis,
     not visible in individual study analyses.
     """
+
+    # LLM outputs whose generation is switched off because the meta report no longer
+    # renders them. Re-enable one by uncommenting its call site and removing it here;
+    # MetaPipelineOrchestrator._validate_step9_output skips empty-field warnings for these.
+    GATED_FIELDS = (
+        'biological_interpretation',       # Phase 6
+        'discovery_hypotheses_fallback',   # Phase 3A, fills meta_generated_hypotheses
+        'why_meta_unique',                 # _explain_meta_unique_theme
+    )
 
     def __init__(self):
         self.step_number = 9
@@ -280,20 +290,23 @@ class MetaStep09DiscoveryAnalysis:
             print(f'    Resolution gain: {significance_hierarchy["resolution_gain"]}x more ranking resolution')
             print(f'    Priority tiers: {significance_hierarchy["n_tiers"]}')
 
-        # Phase 3A: Generate hypotheses from discovery findings if step4 produced none
-        if not meta_generated_hypotheses:
-            print('\n  [Phase 3A] Generating hypotheses from discovery findings...')
-            meta_generated_hypotheses = self._generate_discovery_hypotheses(
-                emergent_theme_combinations=emergent_theme_combinations,
-                cross_dataset_convergence=cross_dataset_convergence,
-                weak_signal_amplification=weak_signal_amplification,
-                novel_cooccurrence_pairs=novel_cooccurrence_pairs,
-                enhanced_pathways=enhanced_pathways,
-                significance_hierarchy=significance_hierarchy,
-                study_context=study_context,
-                n_datasets=len(dataset_names)
-            )
-            print(f'    Generated {len(meta_generated_hypotheses)} hypotheses from discoveries')
+        # Phase 3A: Generate hypotheses from discovery findings if step4 produced none.
+        # GATED: this unvalidated fallback is what produced the invented p-values and dataset
+        # counts in the CS2 report (audit #50, #40). The report now shows step 4's own
+        # hypotheses, so the fallback is no longer generated or persisted.
+        # if not meta_generated_hypotheses:
+        #     print('\n  [Phase 3A] Generating hypotheses from discovery findings...')
+        #     meta_generated_hypotheses = self._generate_discovery_hypotheses(
+        #         emergent_theme_combinations=emergent_theme_combinations,
+        #         cross_dataset_convergence=cross_dataset_convergence,
+        #         weak_signal_amplification=weak_signal_amplification,
+        #         novel_cooccurrence_pairs=novel_cooccurrence_pairs,
+        #         enhanced_pathways=enhanced_pathways,
+        #         significance_hierarchy=significance_hierarchy,
+        #         study_context=study_context,
+        #         n_datasets=len(dataset_names)
+        #     )
+        #     print(f'    Generated {len(meta_generated_hypotheses)} hypotheses from discoveries')
 
         # 5. Find meta-unique therapeutic targets (skip when synthetic)
         if all_synthetic:
@@ -307,22 +320,24 @@ class MetaStep09DiscoveryAnalysis:
             print(f'    Found {len(meta_unique_targets)} meta-unique therapeutic targets')
 
         # 6. Generate biological interpretation
-        print('\n  [Phase 6] Generating biological interpretation...')
-        biological_interpretation = self._generate_biological_interpretation(
-            meta_unique_themes,
-            enhanced_pathways,
-            meta_unique_hypotheses,
-            cross_study_mechanisms,
-            meta_unique_targets,
-            study_context,
-            all_synthetic=all_synthetic,
-            organizational_themes=organizational_themes,
-            emergent_theme_combinations=emergent_theme_combinations,
-            cross_dataset_convergence=cross_dataset_convergence,
-            weak_signal_amplification=weak_signal_amplification,
-            novel_cooccurrence_pairs=novel_cooccurrence_pairs,
-            n_datasets=len(dataset_names)
-        )
+        # GATED: its report section is commented out in meta_step08 (audit #45-#47).
+        biological_interpretation = ''
+        # print('\n  [Phase 6] Generating biological interpretation...')
+        # biological_interpretation = self._generate_biological_interpretation(
+        #     meta_unique_themes,
+        #     enhanced_pathways,
+        #     meta_unique_hypotheses,
+        #     cross_study_mechanisms,
+        #     meta_unique_targets,
+        #     study_context,
+        #     all_synthetic=all_synthetic,
+        #     organizational_themes=organizational_themes,
+        #     emergent_theme_combinations=emergent_theme_combinations,
+        #     cross_dataset_convergence=cross_dataset_convergence,
+        #     weak_signal_amplification=weak_signal_amplification,
+        #     novel_cooccurrence_pairs=novel_cooccurrence_pairs,
+        #     n_datasets=len(dataset_names)
+        # )
 
         # 7. (Significance hierarchy already computed in Phase 4D above)
 
@@ -347,6 +362,7 @@ class MetaStep09DiscoveryAnalysis:
             'cross_dataset_convergence_count': len(cross_dataset_convergence),
             'weak_signal_amplification_count': len(weak_signal_amplification),
             'novel_cooccurrence_pairs_count': len(novel_cooccurrence_pairs),
+            'gated_fields': list(self.GATED_FIELDS),
         }
 
         # Summary statistics — adjust for synthetic
@@ -648,9 +664,11 @@ class MetaStep09DiscoveryAnalysis:
                 biological_context = theme.get('biological_context', '')
 
                 # Generate LLM explanation of why this theme is meta-unique
-                why_unique = self._explain_meta_unique_theme(
-                    theme_name, pathways, shared_genes, study_context
-                )
+                # GATED: why_meta_unique is no longer rendered (see GATED_FIELDS).
+                why_unique = ''
+                # why_unique = self._explain_meta_unique_theme(
+                #     theme_name, pathways, shared_genes, study_context
+                # )
 
                 meta_unique_themes.append(MetaUniqueTheme(
                     theme_name=theme_name,
@@ -720,9 +738,11 @@ class MetaStep09DiscoveryAnalysis:
 
             if meta_only == total:
                 # All pathways meta-only — genuinely novel theme
-                why_unique = self._explain_meta_unique_theme(
-                    theme_name, theme_pathways, shared_genes, study_context
-                )
+                # GATED: why_meta_unique is no longer rendered (see GATED_FIELDS).
+                why_unique = ''
+                # why_unique = self._explain_meta_unique_theme(
+                #     theme_name, theme_pathways, shared_genes, study_context
+                # )
                 genuinely_novel.append(MetaUniqueTheme(
                     theme_name=theme_name,
                     pathways=theme_pathways,
@@ -732,9 +752,11 @@ class MetaStep09DiscoveryAnalysis:
                 ))
             elif meta_only > 0:
                 # Some pathways meta-only — partially novel
-                why_unique = self._explain_meta_unique_theme(
-                    theme_name, meta_only_pathways, shared_genes, study_context
-                )
+                # GATED: why_meta_unique is no longer rendered (see GATED_FIELDS).
+                why_unique = ''
+                # why_unique = self._explain_meta_unique_theme(
+                #     theme_name, meta_only_pathways, shared_genes, study_context
+                # )
                 genuinely_novel.append(MetaUniqueTheme(
                     theme_name=theme_name,
                     pathways=theme_pathways,
@@ -2098,43 +2120,49 @@ Do not invent specific gene names or pathway pairings not listed in the data."""
         """Generate natural language summary of individual dataset findings."""
 
         # Build pathway frequency text
+        shown = top_pathways[:10]
         pathway_lines = []
-        for pw in top_pathways[:10]:
-            pathway_lines.append(f"- {pw['name']}: found in {pw['count']}/{len(dataset_names)} studies (best p={pw['best_pvalue']:.2e})")
+        for pw in shown:
+            pathway_lines.append(f"- {pw['name']}: found in {pw['count']}/{len(dataset_names)} datasets (best p={pw['best_pvalue']:.2e})")
         pathway_text = '\n'.join(pathway_lines)
 
         total_unique = len(pathway_counts)
         in_multiple = sum(1 for p in pathway_counts.values() if p['count'] >= 2)
         in_3_plus = sum(1 for p in pathway_counts.values() if p['count'] >= 3)
 
-        prompt = f"""Summarize the findings from {len(dataset_names)} individual studies BEFORE meta-analysis.
+        prompt = f"""Summarize the findings from {len(dataset_names)} individual datasets analyzed separately.
 
 **Study Context:** {study_context}
 
-**Top Pathways by Frequency Across Individual Studies:**
+**Top {len(shown)} of {total_unique} Pathways by Frequency Across Individual Datasets:**
 {pathway_text}
 
 **Statistics:**
 - Total unique pathways identified: {total_unique}
-- Pathways found in >=2 studies: {in_multiple}
-- Pathways found in >=3 studies: {in_3_plus}
-- Pathways found in only 1 study: {total_unique - in_multiple}
+- Pathways found in >=2 datasets: {in_multiple}
+- Pathways found in >=3 datasets: {in_3_plus}
+- Pathways found in only 1 dataset: {total_unique - in_multiple}
 
-Write 2-3 paragraphs describing:
-1. What are the main biological pathways found across individual studies?
-2. What do these pathways tell us about the biological response being studied?
-3. What are the limitations - why might some pathways appear in few studies?
-
-Focus on biological meaning. This establishes the BASELINE before showing what meta-analysis adds."""
+Write ONE paragraph of at most 120 words: the main pathways recurring across datasets and what they indicate about the biological response. Then add ONE sentence on why some pathways appear in only a few datasets. No headings, no bullet points. Do not restate the numbers above."""
 
         try:
             response = self.llm.chat(
                 messages=[{'role': 'user', 'content': prompt}],
-                max_tokens=800,
+                # The answer itself is ~140 words (~200 tokens). The rest is headroom for
+                # gpt-oss reasoning tokens, which count against the same limit: at 800 the
+                # CS2 summary stopped mid-sentence, and a short answer can still hit the
+                # wall after a few hundred reasoning tokens.
+                max_tokens=4000,
                 temperature=0,
-                seed=42
+                seed=42,
+                require_complete=True
             )
             return response.strip()
+        except LLMIncompleteError as e:
+            msg = f"Individual findings summary incomplete, omitted: {e}"
+            logger.warning(msg)
+            self._warnings.append(msg)
+            return '*[Dataset summary could not be generated in full and is omitted.]*'
         except Exception as e:
             msg = f"LLM failed in _generate_individual_findings_summary: {e}"
             logger.warning(msg)

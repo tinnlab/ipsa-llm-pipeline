@@ -1,14 +1,16 @@
 """
 Meta-Step 08: Comparative Report Generation
 
-Generates a comprehensive markdown report comparing meta-analysis results
-with individual dataset results. Focuses on reproducibility and power gain.
+Generates the meta-analysis report. It mirrors the single-route report: the
+combined-data run's step-6 report supplies the Executive Summary and analysis
+sections, and "Findings Across Individual Datasets" is the one meta-only section.
 """
 
+import re
 import sys
 import json
 from pathlib import Path
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Tuple
 from datetime import datetime
 
 # Add parent directory to path for imports
@@ -74,62 +76,213 @@ class MetaStep08ComparativeReport:
             ''
         )
 
-        sections = []
+        meta_results = meta_results or {}
+        individual = discovery_results.get('individual_findings') or {}
+        n_selected = (meta_results.get('input_summary') or {}).get('num_pathways')
 
-        # 1. Title and overview
-        sections.append(self._generate_header(study_type, tissue, len(dataset_names), metadata))
+        # The meta report mirrors the single-route report: the combined-data run's own step-6
+        # report supplies the Executive Summary and the analysis sections, and the per-dataset
+        # findings are the one meta-only section. Removed sections are commented out below,
+        # never deleted; each generator is intact, so re-enabling one is uncommenting a line.
+        step6_chunks = self._split_markdown_sections(
+            ((meta_results.get('steps') or {}).get('step5') or {}).get('markdown_content') or ''
+        )
+        step6_by_kind = {}
+        for kind, heading, body in step6_chunks:
+            step6_by_kind.setdefault(kind, []).append((kind, heading, body))
 
-        # 2. INDIVIDUAL STUDIES SUMMARY (BASELINE - what we found before meta-analysis)
-        if discovery_results and discovery_results.get('individual_findings'):
-            sections.append(self._generate_individual_studies_summary(discovery_results))
+        # Ordered (number?, heading text, body). Numbered sections are renumbered 1..N
+        # contiguously below; Executive Summary and Appendices stay unnumbered, as in step 6.
+        ordered = []
 
-        # 3. META-ANALYSIS DISCOVERIES (what meta-analysis ADDED)
-        if discovery_results:
-            sections.append(self._generate_discovery_summary(discovery_results))
+        # Executive Summary (step 6) + one line of real meta facts
+        meta_facts = self._meta_facts_line(individual, n_selected)
+        if step6_by_kind.get('executive_summary'):
+            for _, heading, body in step6_by_kind['executive_summary']:
+                ordered.append((False, heading, body.rstrip() + '\n\n' + meta_facts))
+        elif step6_chunks:
+            ordered.append((False, 'Executive Summary', meta_facts))
+        else:
+            ordered.append((False, 'Executive Summary', '\n'.join([
+                meta_facts,
+                '',
+                '> **The combined-data report was not produced**, so the theme, hub-gene, '
+                'mechanism and hypothesis sections are missing from this report.',
+                '> Error: ' + str(meta_results.get('error') or 'no step-6 report in the combined-data results'),
+            ])))
 
-        # Executive summary with discovery highlights
-        sections.append(self._generate_executive_summary(reproducibility_results, discovery_results))
+        # Findings Across Individual Datasets: the only meta-only section
+        if individual:
+            heading, body = self._split_own_section(
+                self._generate_individual_studies_summary(discovery_results, n_selected)
+            )
+            ordered.append((True, heading, body))
 
-        # 4. META-UNIQUE DISCOVERIES SECTION (detailed)
-        if discovery_results:
-            sections.append(self._generate_meta_unique_discoveries_section(discovery_results))
+        # Step-6 analysis sections in step-6 order, body text verbatim. An unrecognised '##'
+        # chunk is kept where it appeared, never dropped.
+        for kind, heading, body in step6_chunks:
+            if kind in ('executive_summary', 'appendices'):
+                continue
+            if kind == 'conclusions':
+                body = body.rstrip() + '\n\n' + self._generate_dataset_conclusions(
+                    individual, n_selected, meta_results
+                )
+            ordered.append((True, heading, body))
 
-        # 5. Enhanced significance pathways (from discovery analysis)
-        if discovery_results.get('enhanced_significance_pathways'):
-            sections.append(self._generate_enhanced_significance_section(discovery_results))
+        for _, heading, body in step6_by_kind.get('appendices', []):
+            ordered.append((False, heading, body))
 
-        # 6. Cross-study validated mechanisms
-        if discovery_results.get('cross_study_mechanisms'):
-            sections.append(self._generate_cross_study_validation_section(discovery_results))
+        # --- Removed sections (meta-report restructure). Commented out, not deleted. ---
+        # Key Meta-Analysis Findings / Discoveries
+        # sections.append(self._generate_discovery_summary(discovery_results))
+        # Old executive summary (reproducibility + power gain) — replaced by step 6's
+        # sections.append(self._generate_executive_summary(reproducibility_results, discovery_results))
+        # Meta-Analysis Insights: its themes and hypotheses duplicate step 1 and step 4; the
+        # meta-unique hypotheses/targets subsections are permanently empty (all_synthetic)
+        # sections.append(self._generate_meta_unique_discoveries_section(discovery_results))
+        # Enhanced Significance: Power Gain, incl. Priority Hierarchy and full table (#11, #33)
+        # sections.append(self._generate_enhanced_significance_section(discovery_results))
+        # Cross-Study Validated Mechanisms: structurally empty when all_synthetic
+        # sections.append(self._generate_cross_study_validation_section(discovery_results))
+        # Emergent Theme Combinations
+        # sections.append(self._generate_emergent_theme_combinations_section(discovery_results))
+        # Cross-Dataset Pathway Convergence
+        # sections.append(self._generate_cross_dataset_convergence_section(discovery_results))
+        # Weak Signal Amplification: cannot fire. The finder wants per-dataset p in 0.01-0.05,
+        # but per-dataset lists are pre-filtered at pValueFDR < 0.05 (cpa-website
+        # aiWorkflow.js:344), so that band is empty by construction. Reviving it needs
+        # unfiltered per-dataset pathway results.
+        # sections.append(self._generate_weak_signal_amplification_section(discovery_results))
+        # Novel Pathway Co-occurrence Pairs (#24)
+        # sections.append(self._generate_novel_cooccurrence_pairs_section(discovery_results))
+        # Reproducibility Overview (#25-#29: wrong word, union denominator)
+        # sections.append(self._generate_reproducibility_overview(reproducibility_results))
+        # Direction Concordance Analysis (#35-#37: the 99.0% is a sparsity artifact)
+        # sections.append(self._generate_concordance_analysis(reproducibility_results))
+        # Biological Interpretation of Meta-Analysis Findings (#45-#47)
+        # sections.append(self._generate_biological_interpretation_section(discovery_results))
+        # Old Conclusions: built almost entirely on the sections above; step 6's own
+        # Conclusions plus _generate_dataset_conclusions replace it
+        # sections.append(self._generate_conclusions(reproducibility_results, discovery_results))
 
-        # 6A-6F. New emergent discovery sections
-        if discovery_results.get('emergent_theme_combinations'):
-            sections.append(self._generate_emergent_theme_combinations_section(discovery_results))
-        if discovery_results.get('cross_dataset_convergence'):
-            sections.append(self._generate_cross_dataset_convergence_section(discovery_results))
-        if discovery_results.get('weak_signal_amplification'):
-            sections.append(self._generate_weak_signal_amplification_section(discovery_results))
-        if discovery_results.get('novel_cooccurrence_pairs'):
-            sections.append(self._generate_novel_cooccurrence_pairs_section(discovery_results))
-
-        # 7. Reproducibility overview
-        sections.append(self._generate_reproducibility_overview(reproducibility_results))
-
-        # 8. Direction concordance analysis
-        sections.append(self._generate_concordance_analysis(reproducibility_results))
-
-        # 9. Biological interpretation (from discovery analysis)
-        if discovery_results.get('biological_interpretation'):
-            sections.append(self._generate_biological_interpretation_section(discovery_results))
-
-        # 10. Conclusions with discovery insights
-        sections.append(self._generate_conclusions(reproducibility_results, discovery_results))
+        sections = [self._generate_header(study_type, tissue, len(dataset_names), metadata)]
+        number = 0
+        for numbered, heading, body in ordered:
+            if numbered:
+                number += 1
+                heading = f'{number}. {heading}'
+            sections.append(f'## {heading}\n\n{body.strip()}')
 
         report = '\n\n'.join(sections)
 
         print(f'  ✓ Report generated ({len(report)} characters)')
 
         return report
+
+    # Step-6 section kinds, matched on the heading text after any "N. " prefix
+    # (step 6 numbers its sections; step 3/4 report_section headings may differ).
+    _STEP6_SECTION_KINDS = (
+        ('Executive Summary', 'executive_summary'),
+        ('Pathway Theme', 'themes'),
+        ('Network Hub', 'hub_genes'),
+        ('Pathway Mechanism', 'mechanisms'),
+        ('Mechanistic Hypothes', 'hypotheses'),
+        ('Therapeutic', 'therapeutics'),
+        ('Summary and Conclusions', 'conclusions'),
+        ('Appendices', 'appendices'),
+    )
+
+    @classmethod
+    def _split_markdown_sections(cls, markdown: str) -> List[Tuple[str, str, str]]:
+        """Split a step-6 report into ordered (kind, heading text, body) at its '## ' headings.
+
+        The heading text has step 6's "N. " prefix removed so the meta report can renumber.
+        Whatever precedes the first '## ' (step 6's title and metadata header) is dropped:
+        the meta header already carries the metadata. Unknown headings get kind 'other'.
+        """
+        chunks = []
+        heading, body = None, []
+        for line in markdown.splitlines():
+            if line.startswith('## '):
+                if heading is not None:
+                    chunks.append((heading, '\n'.join(body)))
+                heading, body = line[3:].strip(), []
+            elif heading is not None:
+                body.append(line)
+        if heading is not None:
+            chunks.append((heading, '\n'.join(body)))
+
+        result = []
+        for heading, body in chunks:
+            text = re.sub(r'^\d+\.\s*', '', heading)
+            kind = next((k for prefix, k in cls._STEP6_SECTION_KINDS if text.startswith(prefix)), 'other')
+            result.append((kind, text, body))
+        return result
+
+    @staticmethod
+    def _split_own_section(section: str) -> Tuple[str, str]:
+        """Split one generated '## Heading' section into (heading text, body)."""
+        first, _, rest = section.lstrip().partition('\n')
+        return first[3:].strip() if first.startswith('## ') else first.strip(), rest
+
+    @staticmethod
+    def _meta_facts_line(individual: Dict[str, Any], n_selected: Any) -> str:
+        """The one meta-aware line added to step 6's dataset-blind Executive Summary."""
+        n_datasets = individual.get('total_datasets')
+        in_multiple = individual.get('pathways_in_multiple')
+        total_unique = individual.get('total_unique_pathways')
+
+        datasets_part = (f'{n_datasets} datasets pooled' if n_datasets is not None
+                         else 'number of pooled datasets unavailable')
+        if in_multiple is None:
+            pathways_part = 'per-dataset pathway frequencies unavailable'
+        elif n_selected is None:
+            pathways_part = (f'{in_multiple} pathways are significant (FDR < 0.05) in two or more '
+                             'datasets (the number of selected pathways is unavailable)')
+        elif total_unique is not None and total_unique > n_selected:
+            pathways_part = (f'{in_multiple} pathways are significant (FDR < 0.05) in two or more '
+                             f'datasets; the per-dataset lists hold {total_unique} pathways, more than '
+                             f'the {n_selected} selected, so they were not restricted to the selection')
+        else:
+            pathways_part = (f'{in_multiple} of {n_selected} selected pathways are significant '
+                             '(FDR < 0.05) in two or more datasets')
+        return f'**Meta-analysis scope:** {datasets_part}; {pathways_part}.'
+
+    @staticmethod
+    def _generate_dataset_conclusions(
+        individual: Dict[str, Any], n_selected: Any, meta_results: Dict[str, Any]
+    ) -> str:
+        """Per-dataset frequency of the selected pathways, appended to step 6's Conclusions."""
+        lines = ['### Across Individual Datasets', '']
+        if individual:
+            total_datasets = individual.get('total_datasets', 0)
+            total_unique = individual.get('total_unique_pathways', 0)
+            in_multiple = individual.get('pathways_in_multiple', 0)
+            in_single = individual.get('pathways_in_single', 0)
+            lines.append(f'Selected pathways by the number of the {total_datasets} individual datasets '
+                         'in which they are significant (FDR < 0.05):')
+            lines.append('')
+            lines.append(f'- significant in two or more datasets: {in_multiple}')
+            lines.append(f'- significant in exactly one dataset: {in_single}')
+            if n_selected is not None and n_selected >= total_unique:
+                lines.append(f'- significant in no individual dataset: {n_selected - total_unique} '
+                             f'(of {n_selected} selected)')
+            elif n_selected is not None:
+                lines.append(f'- the per-dataset lists hold {total_unique} pathways, more than the '
+                             f'{n_selected} selected; they were not restricted to the selection')
+        else:
+            lines.append('*Per-dataset pathway frequencies are unavailable for this run.*')
+
+        step4 = (meta_results.get('steps') or {}).get('step4') or {}
+        hypotheses = step4.get('hypotheses') or []
+        lines.append('')
+        if hypotheses:
+            noun = 'hypothesis' if len(hypotheses) == 1 else 'hypotheses'
+            lines.append(f'The combined-data analysis generated {len(hypotheses)} mechanistic '
+                         f'{noun} (see Mechanistic Hypotheses above).')
+        else:
+            lines.append('No mechanistic hypotheses were generated from the combined data.')
+        return '\n'.join(lines)
 
     def _generate_discovery_summary(self, discovery_results: Dict[str, Any]) -> str:
         """Generate prominent summary of meta-analysis discoveries"""
@@ -572,8 +725,8 @@ class MetaStep08ComparativeReport:
 
         return '\n'.join(lines)
 
-    def _generate_individual_studies_summary(self, discovery_results: Dict[str, Any]) -> str:
-        """Generate summary of findings from individual studies (baseline before meta-analysis)"""
+    def _generate_individual_studies_summary(self, discovery_results: Dict[str, Any], n_selected: Any = None) -> str:
+        """Generate the Findings Across Individual Datasets section (the one meta-only section)"""
         individual = discovery_results.get('individual_findings', {})
 
         if not individual:
@@ -585,62 +738,73 @@ class MetaStep08ComparativeReport:
         in_single = individual.get('pathways_in_single', 0)
         top_pathways = individual.get('top_pathways', [])
         llm_summary = individual.get('llm_summary', '')
+        # top_pathways is capped upstream; the full frequency table is pathway_counts
+        n_ranked = len(individual.get('pathway_counts') or {}) or total_pathways
 
         lines = [
-            '## What Individual Studies Found',
+            '## Findings Across Individual Datasets',
             '',
             f'This section summarizes findings from analyzing **{total_datasets} individual datasets**',
-            'separately, before combining them in meta-analysis. This establishes the baseline',
-            'of what we could learn from individual studies alone.',
+            'separately. For each dataset, a pathway counts when it is significant (FDR < 0.05)',
+            'in that dataset.',
             ''
         ]
 
         # Add LLM-generated natural language summary
         if llm_summary:
             lines.extend([
-                '### Summary of Individual Study Findings',
+                '### Summary of Dataset Findings',
                 '',
                 llm_summary,
                 ''
             ])
 
         # Add statistics
-        lines.extend([
-            '### Individual Studies Statistics',
+        rows = [
+            '### Dataset Statistics',
             '',
             '| Metric | Value |',
             '|--------|-------|',
             f'| Total datasets analyzed | {total_datasets} |',
-            f'| Total unique pathways identified | {total_pathways} |',
-            f'| Pathways found in ≥2 studies | {in_multiple} |',
-            f'| Pathways found in only 1 study | {in_single} |',
+        ]
+        if n_selected is not None:
+            rows.append(f'| Pathways selected for analysis | {n_selected} |')
+        rows.extend([
+            f'| Pathways significant in at least 1 dataset | {total_pathways} |',
+            f'| Pathways found in ≥2 datasets | {in_multiple} |',
+            f'| Pathways found in only 1 dataset | {in_single} |',
             ''
         ])
+        lines.extend(rows)
 
         # Add top pathways table
         if top_pathways:
+            shown = top_pathways[:15]
             lines.extend([
                 '### Most Frequently Identified Pathways',
                 '',
-                '| Pathway | Found in N Studies | Best p-value |',
-                '|---------|-------------------|--------------|'
+                f'*Showing top {len(shown)} of {n_ranked} pathways, ranked by the number of datasets.*',
+                '',
+                '| Pathway | Found in N Datasets | Best p-value |',
+                '|---------|--------------------|--------------|'
             ])
 
-            for pw in top_pathways[:15]:
-                name = pw.get('name', 'Unknown')[:50]
+            for pw in shown:
+                name = pw.get('name', 'Unknown')  # full name; was cut at 50 chars
                 count = pw.get('count', 0)
                 pval = pw.get('best_pvalue', 1.0)
                 lines.append(f'| {name} | {count} | {pval:.2e} |')
 
-            lines.append('')
+            lines.extend([
+                '',
+                '*Not shown here: which datasets each pathway was found in, and its per-dataset '
+                'p-values and directions.*',
+                ''
+            ])
 
-        # Transition to meta-analysis
-        lines.extend([
-            '---',
-            '',
-            '*The following sections show what meta-analysis discovered BEYOND these individual findings.*',
-            ''
-        ])
+        # The former closing line ("The following sections show what meta-analysis
+        # discovered BEYOND these individual findings.") is gone: the sections that follow
+        # are the combined-data analysis, not meta-unique findings.
 
         return '\n'.join(lines)
 
