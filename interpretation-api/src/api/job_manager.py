@@ -48,17 +48,24 @@ PIPELINE_STEPS = [
     }
 ]
 
-# Additional steps that only run in the meta-analysis pipeline
+# Additional steps that only run in the meta-analysis pipeline, in execution order
+# (matches server.py meta_steps_info)
 META_PIPELINE_STEPS = PIPELINE_STEPS + [
+    # Disabled: Reproducibility Analysis no longer runs, because its output no longer reaches the report.
+    # {
+    #     "step": 6,
+    #     "name": "Reproducibility Analysis",
+    #     "message": "Comparing findings across individual datasets for reproducibility..."
+    # },
     {
         "step": 6,
-        "name": "Reproducibility Analysis",
-        "message": "Comparing findings across individual datasets for reproducibility..."
+        "name": "Cross-Dataset Findings",
+        "message": "Summarising findings across individual datasets"
     },
     {
         "step": 7,
-        "name": "Comparative Report",
-        "message": "Generating comparative analysis report..."
+        "name": "Final Report",
+        "message": "Assembling the final report"
     }
 ]
 

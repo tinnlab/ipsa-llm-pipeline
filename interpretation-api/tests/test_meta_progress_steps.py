@@ -35,6 +35,13 @@ def test_meta_steps_info_contiguous_without_reproducibility(monkeypatch, with_ge
     assert "Reproducibility Analysis" not in names
 
 
+def test_fallback_meta_steps_match_declared(monkeypatch):
+    from src.api.job_manager import META_PIPELINE_STEPS
+    job = _submit(monkeypatch, with_genes=True)
+    assert [(s["step"], s["name"]) for s in META_PIPELINE_STEPS[-2:]] == \
+           [(s["step"], s["name"]) for s in job.steps_info[-2:]]
+
+
 @dataclass
 class _Discovery:
     summary: dict = field(default_factory=dict)
