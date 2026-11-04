@@ -10,6 +10,7 @@ from ..config import settings
 
 # Pipeline imports
 from ..pipeline.orchestrator import PipelineOrchestrator
+from ..agents import prompt_log
 from .job_manager import job_manager, JobStatus
 from .models.pipeline_models import (
     PipelineInput,
@@ -27,16 +28,15 @@ from .models.pipeline_models import (
 )
 
 app = FastAPI(
-    title="IPSA Interpretation Pipeline API",
-    description="Multi-step LLM interpretation of pathway-enrichment and differential-expression results",
+    title="MCQ Pipeline API",
+    description="API for pathway analysis pipeline",
     version="1.0.0"
 )
 
-# CORS. The default is permissive so the service works out of the box behind any
-# front-end; restrict allow_origins to your own origins before exposing it publicly.
+# CORS middleware for Meteor app integration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # Configure based on your Meteor app URL
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -62,6 +62,11 @@ async def startup_event():
         enable_validation=settings.PIPELINE_ENABLE_VALIDATION,
         strict_mode=settings.PIPELINE_STRICT_MODE
     )
+    # State the resolved log root out loud. This feature's worst failure is silent: if the
+    # configured directory is not the mounted volume, logging keeps working, writes into the
+    # container's writable layer, and the next redeploy wipes every log with no error anywhere.
+    prompt_log.log_startup_banner()
+    prompt_log.prune()
     print("Pipeline Service initialized")
 
 
@@ -76,7 +81,7 @@ async def root():
     """Root endpoint"""
     return {
         "status": "running",
-        "service": "IPSA Interpretation Pipeline API",
+        "service": "MCQ Pipeline API",
         "version": "1.0.0"
     }
 
@@ -86,7 +91,7 @@ async def health_check():
     """Health check endpoint"""
     return {
         "status": "healthy",
-        "service": "IPSA Interpretation Pipeline API",
+        "service": "MCQ Pipeline API",
         "version": "1.0.0"
     }
 
@@ -226,8 +231,7 @@ async def submit_pipeline_job(
     3. Pathway Mechanisms
     4. Hypothesis Generation
     5. Final Report Generation (Markdown)
-
-    Steps 2 and 3 are skipped when the input carries no differentially expressed genes.
+    (The former Step 5, Therapeutic Implications, has been removed.)
 
     Returns a job ID that can be used to check status and retrieve results.
     """
@@ -251,6 +255,8 @@ async def submit_pipeline_job(
             steps_info.append({"step": 2, "name": "Hub Gene Detection", "message": "Analyzing protein-protein interaction network via STRING database..."})
             steps_info.append({"step": 3, "name": "Pathway Mechanisms", "message": "Fetching molecular interactions from pathway databases..."})
         steps_info.append({"step": 4, "name": "Hypothesis Generation", "message": "Generating testable research hypotheses from pathway analysis..."})
+        # Report generation is the final step (Step 5); the old Step 5 Therapeutic
+        # Implications has been removed, so the report moved up from 6 to 5.
         steps_info.append({"step": 5, "name": "Report Generation", "message": "Compiling analysis results into final report..."})
 
         # Create job
@@ -288,14 +294,14 @@ async def submit_meta_pipeline_job(
     """
     Submit a meta-analysis pipeline job for async processing.
 
-    Runs the standard 5-step pipeline in parallel on:
+    Runs the standard 6-step pipeline in parallel on:
     - Meta-analysis data (combined from all studies)
     - Individual dataset data (each study separately)
 
     Then performs:
-    - Meta-Step 7: Reproducibility Analysis
-    - Meta-Step 9: Discovery Analysis
-    - Meta-Step 8: Comparative Report Generation
+    - Meta-Step 9: Discovery Analysis (progress step 6, Cross-Dataset Findings)
+    - Meta-Step 8: Comparative Report Generation (progress step 7, Final Report)
+    Meta-Step 7 (Reproducibility Analysis) is disabled; its output no longer reaches the report.
 
     Returns a job ID that can be used to check status and retrieve results.
     """
@@ -335,12 +341,14 @@ async def submit_meta_pipeline_job(
             meta_steps_info.append({"step": 2, "name": "Hub Genes", "message": "Detecting hub genes from combined data"})
             meta_steps_info.append({"step": 3, "name": "Pathway Mechanisms", "message": "Analyzing pathway mechanisms from combined data"})
         meta_steps_info.append({"step": 4, "name": "Hypothesis Generation", "message": "Generating mechanistic hypotheses from combined data"})
-        # Step 5 = the per-analysis report; the meta-only steps follow it.
+        # Step 5 = combined-data report; meta-only steps follow, numbered contiguously in
+        # execution order (must match the set_current_step ids in meta_orchestrator.execute).
         meta_steps_info.extend([
             {"step": 5, "name": "Analysis Report", "message": "Generating analysis report from combined data"},
-            {"step": 6, "name": "Reproducibility Analysis", "message": "Comparing results across datasets"},
-            {"step": 8, "name": "Discovery Analysis", "message": "Identifying meta-unique findings"},
-            {"step": 7, "name": "Comparative Report", "message": "Generating final comparative report"},
+            # Disabled: Reproducibility Analysis no longer runs, because its output no longer reaches the report.
+            # {"step": 6, "name": "Reproducibility Analysis", "message": "Comparing results across datasets"},
+            {"step": 6, "name": "Cross-Dataset Findings", "message": "Summarising findings across individual datasets"},
+            {"step": 7, "name": "Final Report", "message": "Assembling the final report"},
         ])
 
         # Create job with meta input as reference
@@ -479,7 +487,7 @@ async def run_single_step(
     Run a single pipeline step.
 
     Args:
-        step_number: Step number to run (1-5)
+        step_number: Step number to run (1-6)
         request: Step request with input data and previous results
 
     Steps:
@@ -488,6 +496,9 @@ async def run_single_step(
     3. Pathway Mechanisms (requires steps 1-2 results)
     4. Hypothesis Generation (requires steps 1-3 results)
     5. Final Report Generation (requires steps 1-4 results)
+
+    (The former Step 5, Therapeutic Implications, has been removed; report generation
+    is now Step 5.)
     """
     try:
         if step_number < 1 or step_number > 5:

@@ -41,6 +41,9 @@ class StepValidators:
         """
         cleaned = copy.deepcopy(step_dict)
         removed: List[str] = []
+        # Gene comparisons are case-insensitive on both sides: a mouse-cased card gene
+        # ("Ndufs1") must match an upper-case allow-list entry ("NDUFS1") and vice versa.
+        allow_genes_upper = {str(g).upper() for g in allow_genes if g}
 
         if step_no == 1:
             for theme in cleaned.get('themes', []) or []:
@@ -62,7 +65,7 @@ class StepValidators:
                     kept = []
                     for hub in items:
                         gene = hub.get('gene', '') if isinstance(hub, dict) else ''
-                        if gene and gene not in allow_genes:
+                        if gene and str(gene).upper() not in allow_genes_upper:
                             removed.append(gene)
                         else:
                             kept.append(hub)
@@ -76,7 +79,7 @@ class StepValidators:
                 kept = []
                 for gi in mech.get('deGeneInvolvement', []) or []:
                     gene = gi.get('gene', '') if isinstance(gi, dict) else ''
-                    if gene and gene not in allow_genes:
+                    if gene and str(gene).upper() not in allow_genes_upper:
                         removed.append(gene)
                     else:
                         kept.append(gi)
@@ -160,11 +163,12 @@ class StepValidators:
                 stats={'num_hubs': 0}
             )
 
-        # Check for hallucinated genes
+        # Check for hallucinated genes (case-insensitive, matching strip_hallucinated_entities)
+        input_upper = {str(g).upper() for g in input_genes if g}
         hallucinated = []
         for hub in hubs:
             gene = hub.get('gene', '')
-            if gene and gene not in input_genes:
+            if gene and str(gene).upper() not in input_upper:
                 hallucinated.append(gene)
 
         if hallucinated:
@@ -211,12 +215,14 @@ class StepValidators:
         if pathway_genes:
             allowed_genes.update(pathway_genes)
 
-        # Check for hallucinated genes in DE involvement
+        # Check for hallucinated genes in DE involvement (case-insensitive, matching
+        # strip_hallucinated_entities, so flags and strips stay the same set)
+        allowed_upper = {str(g).upper() for g in allowed_genes if g}
         hallucinated = []
         for mech in mechanisms:
             for gene_info in mech.get('deGeneInvolvement', []):
                 gene = gene_info.get('gene', '')
-                if gene and gene not in allowed_genes:
+                if gene and str(gene).upper() not in allowed_upper:
                     hallucinated.append(gene)
 
         if hallucinated:
@@ -302,6 +308,145 @@ class StepValidators:
             warnings=warnings,
             stats=stats
         )
+
+    @staticmethod
+    def validate_step5_output(output: Dict[str, Any], input_data: Dict[str, Any]) -> ValidationResult:
+        """
+        Validate Step 5: Therapeutic Implications
+
+        Checks:
+        - Target genes exist in input
+        - Drugs target genes in input
+        - Druggability classifications are reasonable
+        """
+        errors = []
+        warnings = []
+
+        # Check if step was skipped due to missing genes
+        if output.get('metadata', {}).get('skipped'):
+            return ValidationResult(
+                passed=True,
+                errors=[],
+                warnings=['Step 5 was skipped due to missing gene data'],
+                stats={'skipped': True}
+            )
+
+        targets = output.get('therapeutic_targets', [])
+        drugs = output.get('drug_recommendations', [])
+        input_genes = {g.get('geneSymbol', g.get('gene', '')) for g in input_data.get('genes', [])}
+
+        # If no input genes, skip validation
+        if not input_genes:
+            return ValidationResult(
+                passed=True,
+                errors=[],
+                warnings=['No input genes to validate against'],
+                stats={'num_targets': 0, 'num_drugs': 0}
+            )
+
+        # Check for hallucinated target genes
+        hallucinated_targets = []
+        for target in targets:
+            gene = target.get('gene', '')
+            if gene and gene not in input_genes:
+                hallucinated_targets.append(gene)
+
+        if hallucinated_targets:
+            errors.append(f"Hallucinated targets: {', '.join(hallucinated_targets[:5])}")
+
+        # Check for inappropriate drugs (targeting genes not in input)
+        inappropriate_drugs = []
+        for drug in drugs:
+            target_genes = drug.get('targetGenes', [])
+            for target_gene in target_genes:
+                if target_gene not in input_genes:
+                    inappropriate_drugs.append(f"{drug.get('drugName', 'Unknown')} -> {target_gene}")
+                    break
+
+        if inappropriate_drugs:
+            errors.append(f"Inappropriate drugs: {len(inappropriate_drugs)} drugs targeting non-input genes")
+
+        # Check structure
+        if not targets:
+            warnings.append("No therapeutic targets identified")
+
+        if not drugs:
+            warnings.append("No drug recommendations generated")
+
+        # Check confidence distribution
+        confidence_dist = {'high': 0, 'medium': 0, 'low': 0}
+        for drug in drugs:
+            conf = drug.get('confidence', 'unknown').lower()
+            if conf in confidence_dist:
+                confidence_dist[conf] += 1
+
+        stats = {
+            'num_targets': len(targets),
+            'num_drugs': len(drugs),
+            'num_hallucinated_targets': len(hallucinated_targets),
+            'num_inappropriate_drugs': len(inappropriate_drugs),
+            'confidence_distribution': confidence_dist
+        }
+
+        return ValidationResult(
+            passed=len(errors) == 0,
+            errors=errors,
+            warnings=warnings,
+            stats=stats
+        )
+
+    @staticmethod
+    def validate_all_steps(
+        step_outputs: Dict[str, Dict[str, Any]],
+        input_data: Dict[str, Any]
+    ) -> Dict[str, ValidationResult]:
+        """
+        Validate all steps at once
+
+        Args:
+            step_outputs: Dict with keys 'step1', 'step2', etc.
+            input_data: Original input data
+
+        Returns:
+            Dict of validation results for each step
+        """
+        results = {}
+
+        # Collect pathway genes from step 3 for use in step 4 validation
+        pathway_genes = set()
+        if 'step3' in step_outputs:
+            for mech in step_outputs['step3'].get('pathway_mechanisms', []):
+                for rel in mech.get('curatedRelations', []):
+                    pathway_genes.add(rel.get('source', ''))
+                    pathway_genes.add(rel.get('target', ''))
+
+        # Validate each step
+        if 'step1' in step_outputs:
+            results['step1'] = StepValidators.validate_step1_output(
+                step_outputs['step1'], input_data
+            )
+
+        if 'step2' in step_outputs:
+            results['step2'] = StepValidators.validate_step2_output(
+                step_outputs['step2'], input_data
+            )
+
+        if 'step3' in step_outputs:
+            results['step3'] = StepValidators.validate_step3_output(
+                step_outputs['step3'], input_data, pathway_genes
+            )
+
+        if 'step4' in step_outputs:
+            results['step4'] = StepValidators.validate_step4_output(
+                step_outputs['step4'], input_data, pathway_genes
+            )
+
+        if 'step5' in step_outputs:
+            results['step5'] = StepValidators.validate_step5_output(
+                step_outputs['step5'], input_data
+            )
+
+        return results
 
     @staticmethod
     def create_validation_summary(results: Dict[str, ValidationResult]) -> Dict[str, Any]:

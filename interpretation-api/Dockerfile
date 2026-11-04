@@ -10,8 +10,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 # package must be copied with src/ at the top level (see .dockerignore for exclusions).
 COPY . .
 
-# Runtime dirs used by the pipeline (job outputs) and the services' HTTP caches.
-RUN mkdir -p /app/output/pipeline_jobs /app/cache
+# Runtime dirs used by the pipeline (job outputs), the services' HTTP caches, and the
+# LLM prompt/response log. /app/logs/llm_prompts is where docker-compose.prod.yml mounts a
+# host volume — and it is also the code default (config.LLM_PROMPT_LOG_DIR, relative to this
+# WORKDIR), so the logs land on the persisted volume either way.
+RUN mkdir -p /app/output/pipeline_jobs /app/cache /app/logs/llm_prompts
 
 EXPOSE 6000
 

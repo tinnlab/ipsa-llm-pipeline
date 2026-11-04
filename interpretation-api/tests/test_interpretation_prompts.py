@@ -15,6 +15,7 @@ def _bare_step06():
     return step
 
 
+SKIPPED5 = {'metadata': {'skipped': True}}
 
 
 def test_top_enrichment_signals_tolerates_string_scores():
@@ -59,6 +60,7 @@ def test_exec_summary_prompt_includes_down_signals_and_guidance():
         step1={'themes': [{'name': 'Cell cycle control'}]},
         step2={'network_hubs': [{'gene': 'X'}], 'master_regulators': [{'gene': 'CDK1'}]},
         step3={}, step4={'hypotheses': [1]},
+        step5=SKIPPED5,
     )
     prompt = step.llm.chat.call_args.kwargs['messages'][0]['content']
     assert 'Fatty acid degradation' in prompt         # down-regulated signal surfaced

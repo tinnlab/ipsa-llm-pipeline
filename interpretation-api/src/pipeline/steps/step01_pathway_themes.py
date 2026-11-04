@@ -116,16 +116,18 @@ class Step01PathwayThemes:
         logger.info(f'  Pathways: {len(pathways)}')
         logger.info(f'  Genes: {len(genes)}')
         logger.info(f'  Organism: {organism}')
-        logger.info(f'  Significance threshold: FDR < {significance_threshold}')
+        logger.info(f'  Significance threshold: FDR <= {significance_threshold}')
 
-        # Filter to significant pathways only
+        # Filter to significant pathways only: FDR at most the threshold (main L367,
+        # suppl L542 "at most 0.05"). _pathway_fdr is 0.0-safe; the former
+        # `or`-chain read an FDR of exactly 0.0 as 1.0 and dropped the strongest pathways.
         significant_pathways = [
             p for p in pathways
-            if (p.get('p_value_fdr') or p.get('pValueFDR') or 1.0) < significance_threshold
+            if _pathway_fdr(p) <= significance_threshold
         ]
 
         logger.info(f'\n[Filtering]')
-        logger.info(f'  Significant pathways (FDR < {significance_threshold}): {len(significant_pathways)}')
+        logger.info(f'  Significant pathways (FDR <= {significance_threshold}): {len(significant_pathways)}')
 
         if not significant_pathways:
             logger.warning('  No significant pathways available for clustering')
@@ -581,7 +583,7 @@ FILTERING RULES (apply in order):
    - Examples: "Parkinson disease", "Huntington disease", "Alzheimer disease" in lung adenocarcinoma study → FILTER
    - Examples: "Type II diabetes mellitus", "Rheumatoid arthritis" in lung adenocarcinoma study → FILTER
    - Exception: Disease EXACTLY matches target (e.g., "Lung adenocarcinoma" pathway in lung adenocarcinoma study) → KEEP
-   - Rationale: Disease pathways represent specific pathological states in specific organs/systems. Even if they share molecular mechanisms (e.g., mitochondrial dysfunction), they describe different disease contexts and should be filtered.
+   - Rationale: Disease pathways represent specific pathological states in specific organs/systems. Even if they overlap in genes or mechanisms with the target, they describe different disease contexts and should be filtered.
    - IMPORTANT: Do NOT keep disease pathways just because they share genes or mechanisms. Shared genes do NOT justify keeping off-disease pathways.
 
 3. **KEEP general biological mechanisms**
@@ -596,13 +598,18 @@ FILTERING RULES (apply in order):
    - Example: NON-SMALL CELL LUNG CANCER in lung studies → KEEP
 
 IMPORTANT:
-- Sharing genes (e.g., KRAS, TP53, MAPK1, mitochondrial genes) does NOT make an organ-specific or disease-specific pathway relevant
+- Sharing genes (e.g., KRAS, TP53, MAPK1) does NOT make an organ-specific or disease-specific pathway relevant
 - Gene overlap is expected across diseases but does NOT justify keeping off-target disease pathways
 - Be STRICT with disease pathways - they should only be kept if they match the exact target disease
 
 Return VALID JSON only (no markdown, no explanatory text)."""
 
-            user_prompt = f"""Review these pathways from the theme "{theme_name}" for relevance to the experimental context.
+            # NOTE: the theme name is deliberately NOT in this prompt. It is LLM-generated
+            # output from step 1b, and none of the filtering rules below reference it — so
+            # including it only let upstream wording noise change a keep/delete decision
+            # (issue #15: identical input gave 2/3/2 themes). The filter decides from
+            # pathway names + experimental context alone.
+            user_prompt = f"""Review these pathways for relevance to the experimental context.
 
 **Experimental Context:** {context_str}
 
@@ -623,14 +630,14 @@ Return JSON:
 }}
 
 DECISION CRITERIA:
-- FILTER: Pathway name contains organ/tissue different from "{context_str}" (e.g., PANCREATIC, HEPATOCELLULAR, GLIOMA, CARDIAC, DOPAMINERGIC)
+- FILTER: Pathway name names an organ/tissue that differs from the target in "{context_str}" (e.g., PANCREATIC, GLIOMA, CARDIAC, DOPAMINERGIC in a lung study — never filter the target's own organ)
 - FILTER: Pathway name contains disease/disorder keywords AND does NOT match target disease in "{context_str}" (e.g., Parkinson disease, Huntington disease, Alzheimer disease, Type II diabetes)
 - KEEP: Pathway describes general mechanism without organ/disease names (e.g., PI3K-AKT SIGNALING, CELL CYCLE, OXIDATIVE PHOSPHORYLATION, DNA REPLICATION)
 - KEEP: Pathway matches target tissue/disease in "{context_str}"
 
 STRICT RULES:
 1. When pathway name explicitly mentions a different organ/tissue → ALWAYS FILTER (even if it shares genes)
-2. When pathway name explicitly mentions a different disease/disorder → ALWAYS FILTER (even if it shares molecular mechanisms like mitochondrial dysfunction)
+2. When pathway name explicitly mentions a different disease/disorder → ALWAYS FILTER (even if it shares genes or molecular mechanisms with the target)
 3. Gene overlap or mechanistic similarity does NOT justify keeping off-target disease pathways
 4. Be STRICT - only keep disease pathways that exactly match the target disease context"""
 

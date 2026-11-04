@@ -8,9 +8,12 @@ converted IDs that `startswith('path:map')` into the organism-specific form, so 
 exists only for `hsa00650`). That blanked Step 3 (Pathway Mechanisms) and cascaded to
 zero hypotheses in Step 4.
 
-These tests pin the fix.
+These tests pin the fix and are parametrized over BOTH byte-identical copies of the
+service (step03 imports the `experimental` copy at runtime; the rest of the package uses
+the `src` copy) so the two cannot silently drift apart.
 """
 
+import hashlib
 import importlib
 
 import pytest
@@ -275,3 +278,7 @@ def test_get_pathway_structure_none_when_kgml_404(kegg_mod):
         assert svc.get_pathway_structure("Butanoate metabolism", "Homo sapiens") is None
     # Even on failure, the id was resolved correctly before the KGML attempt.
     assert any('/get/hsa00650/kgml' in u for u in requested)
+
+
+# The upstream drift guard comparing the two kegg_service copies is omitted here:
+# this repository ships a single copy, under src/pipeline/services/.

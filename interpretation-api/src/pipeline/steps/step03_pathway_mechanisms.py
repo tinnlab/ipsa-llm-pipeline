@@ -26,9 +26,10 @@ from dataclasses import dataclass, asdict, field
 sys.path.append(str(Path(__file__).parent.parent.parent))
 
 from src.agents.groq_client import GroqClient
-from src.pipeline.services.kegg_service import KEGGService, PathwayStructure, MappedDEGene
+from src.pipeline.services.kegg_service import KEGGService, PathwayStructure, MappedDEGene, entry_symbols
 from src.pipeline.services.reactome_service import ReactomeService
 from src.pipeline.services.pathway_commons_service import PathwayCommonsService
+from src.pipeline.services.pathway_membership_service import PathwayMembershipService
 from src.pipeline.services.regulon_service import RegulonService
 from src.pipeline.json_utils import parse_llm_json
 from src.pipeline.fc_utils import (
@@ -41,8 +42,8 @@ def _enrichment_metric(pathway: Dict):
     """Return (value, metric) for a pathway's enrichment score.
 
     Prefer NES (normalized, unbounded) when present; fall back to the legacy `ES`
-    field only when NES is absent. Some callers historically forwarded the NES value
-    under the name `ES`, so clients that don't yet send `NES` still work.
+    field only when NES is absent. Upstream (the IPSA website) historically forwarded the
+    NES value under the name `ES`, so callers that don't yet send `NES` still work.
     """
     nes = to_float(pathway.get('NES'))
     if nes is not None:
@@ -99,6 +100,381 @@ def _pathway_key(name: str) -> str:
     return _strip_pathway_id_suffix(name).strip().lower()
 
 
+# KEGG relation subtypes with no direction ("---", "-+-", shared compound). For these a
+# listed relation matches in either orientation; every other KEGG subtype is directed
+# and must match source -> target (item 16).
+_UNDIRECTED_KEGG_SUBTYPES = {
+    '', 'binding/association', 'dissociation', 'compound', 'missing interaction',
+    'state change',
+}
+
+
+def _sym(value: Any) -> str:
+    """Upper-case, trimmed gene symbol for comparisons (casing differs across sources:
+    KGML human symbols, mouse symbols, uppercase Pathway Commons rows)."""
+    return str(value or '').strip().upper()
+
+
+def _relation_reference(ps: Dict) -> Optional[Tuple[str, set, set]]:
+    """The retrieved relation set for one pathway, or None when nothing was retrieved.
+
+    Returns (kind, directed_pairs, undirected_pairs), with symbols upper-cased.
+    - KEGG pathway with a KGML structure: its DE relations (main L236, L240). A KGML
+      pathway always has a retrieved set, even if it holds no DE relation.
+    - Pathway with Pathway Commons interactions: those interactions, in either direction.
+    - Anything else (inferred, no retrieval): None. Its relations are kept (decision D3).
+    """
+    if ps.get('source') == 'kegg' and ps.get('confidence') in ('high', 'gene_set'):
+        directed, undirected = set(), set()
+        for rel in ps.get('de_relations', []) or []:
+            src = _sym(getattr(rel, 'source', None) if not isinstance(rel, dict) else rel.get('source'))
+            tgt = _sym(getattr(rel, 'target', None) if not isinstance(rel, dict) else rel.get('target'))
+            if not src or not tgt:
+                continue
+            subtype = (getattr(rel, 'subtype', None) if not isinstance(rel, dict)
+                       else rel.get('subtype')) or ''
+            if str(subtype).strip().lower() in _UNDIRECTED_KEGG_SUBTYPES:
+                undirected.add((src, tgt))
+            else:
+                directed.add((src, tgt))
+        return 'kegg', directed, undirected
+    pc = ps.get('pc_interactions') or []
+    if pc:
+        undirected = set()
+        for inter in pc:
+            src = _sym(getattr(inter, 'source', None) if not isinstance(inter, dict) else inter.get('source'))
+            tgt = _sym(getattr(inter, 'target', None) if not isinstance(inter, dict) else inter.get('target'))
+            if src and tgt:
+                undirected.add((src, tgt))
+        return 'pathway_commons', set(), undirected
+    return None
+
+
+def _relation_in_reference(source: Any, target: Any, ref: Tuple[str, set, set]) -> bool:
+    """True if the (source, target) pair is among the retrieved relations."""
+    _, directed, undirected = ref
+    s, t = _sym(source), _sym(target)
+    return ((s, t) in directed or (s, t) in undirected or (t, s) in undirected)
+
+
+def _rel_end(rel: Any, attr: str) -> Any:
+    return rel.get(attr) if isinstance(rel, dict) else getattr(rel, attr, None)
+
+
+def _input_gene_set(genes: Optional[List[Dict]]) -> set:
+    """Upper-case symbols of the analysis's input gene list."""
+    out = {_sym(g.get('geneSymbol') or g.get('gene')) for g in genes or [] if isinstance(g, dict)}
+    out.discard('')
+    return out
+
+
+def filter_llm_relations(relations: List[Any], input_upper: set) -> Tuple[List[Any], List[Any]]:
+    """LLM-proposed relations (pathways with nothing retrieved, D3 keep): keep a relation
+    only if at least one end is an input gene (owner decision 2026-11-02). Comparison is
+    upper-case on both sides. Returns (kept, dropped). With no input genes there is
+    nothing to check against, so every relation is kept."""
+    if not input_upper:
+        return list(relations or []), []
+    kept, dropped = [], []
+    for rel in relations or []:
+        if _sym(_rel_end(rel, 'source')) in input_upper or _sym(_rel_end(rel, 'target')) in input_upper:
+            kept.append(rel)
+        else:
+            dropped.append(rel)
+    return kept, dropped
+
+
+# ---------------------------------------------------------------------------
+# Pathway Commons relation extraction for non-KEGG pathways (item 19, main L236/L240)
+# ---------------------------------------------------------------------------
+
+# Directed, mechanistic SIF types first; complex membership last. Ranking decides which
+# interactions survive PC_INTERACTION_CAP.
+_PC_TYPE_RANK = {
+    'controls-state-change-of': 0, 'controls-expression-of': 0,
+    'controls-phosphorylation-of': 0, 'controls-transport-of': 1,
+    'controls-production-of': 1, 'consumption-controlled-by': 1,
+    'catalysis-precedes': 1, 'used-to-produce': 2, 'reacts-with': 2,
+    'in-complex-with': 3,
+}
+# Max Pathway Commons interactions kept per pathway (after the DE and membership
+# filters). A bound is needed because a full-membership pathsbetween query can return
+# thousands of rows (MitoPathways "Metabolism": 3,226 mechanistic rows).
+PC_INTERACTION_CAP = 60
+
+
+@dataclass
+class PCRelation:
+    """A retrieved Pathway Commons interaction used as a pathway relation. Symbols are
+    stored upper-case; display_names maps them back to the input casing."""
+    source: str
+    target: str
+    type: str
+    subtype: str
+
+
+@dataclass
+class PCStructure:
+    """Structure placeholder for a pathway grounded on Pathway Commons interactions."""
+    id: str
+    name: str
+    organism: str
+
+
+def filter_pc_interactions(interactions, members_upper: set, de_upper: set,
+                           cap: int = PC_INTERACTION_CAP):
+    """Keep interactions with a DE gene at one end and both ends in the pathway
+    membership, rank them (directed types first, both-ends-DE first), then cap.
+
+    Returns (kept, stats). Symbols in `kept` are upper-case PCRelation objects.
+    Far-end partners outside the queried membership are dropped rather than given a
+    guessed display name (pathsbetween returns intermediates outside the query).
+    """
+    stats = {'retrieved': 0, 'no_de_end': 0, 'outside_membership': 0, 'capped': 0}
+    seen, candidates = set(), []
+    for inter in interactions or []:
+        stats['retrieved'] += 1
+        s = _sym(getattr(inter, 'source', None))
+        t = _sym(getattr(inter, 'target', None))
+        itype = getattr(inter, 'interaction_type', '') or ''
+        if not s or not t or s == t:
+            continue
+        if s not in members_upper or t not in members_upper:
+            stats['outside_membership'] += 1
+            continue
+        if s not in de_upper and t not in de_upper:
+            stats['no_de_end'] += 1
+            continue
+        key = (s, t, itype)
+        if key in seen:
+            continue
+        seen.add(key)
+        both_de = s in de_upper and t in de_upper
+        candidates.append(((_PC_TYPE_RANK.get(itype, 2), 0 if both_de else 1, s, t, itype),
+                           PCRelation(source=s, target=t, type='pathway_commons', subtype=itype)))
+    candidates.sort(key=lambda c: c[0])
+    kept = [rel for _, rel in candidates[:cap]]
+    stats['capped'] = max(0, len(candidates) - cap)
+    stats['kept'] = len(kept)
+    return kept, stats
+
+
+# Item 11/20 (main L240): remove the description of every gene that is not a DE gene and
+# not in a retrieved relation. Switched on by the owner (2026-11-02) after reading the
+# measured flags; the flags are recorded on each card (geneCheckFlags) either way.
+# On cards whose pathway has mapped DE genes, item 21 already drops every gene this
+# would remove; it matters for cards with no mapped DE gene (gene-set cards).
+# STEP3_GENE_CHECK_ENABLED = False  # shipped off pending the owner's decision
+STEP3_GENE_CHECK_ENABLED = True
+
+
+def _retrieved_endpoints(ps: Optional[Dict]) -> set:
+    """Upper-case endpoints of the relations retrieved for a pathway (KGML / PC)."""
+    ref = _relation_reference(ps) if ps else None
+    if ref is None:
+        return set()
+    _, directed, undirected = ref
+    return {g for pair in directed | undirected for g in pair}
+
+
+def normalize_card_genes(mechanisms: List[Dict], pathway_structures: List[Dict],
+                         genes: List[Dict], gene_check_enabled: Optional[bool] = None) -> Dict:
+    """Make each Step 3 card's gene list match the engine's data, in place.
+
+    1. Item 11/20 gene check (main L240): a listed gene that is neither a DE gene nor an
+       endpoint of a relation retrieved for that pathway is flagged (geneCheckFlags) and,
+       when enabled, removed. Runs inside Step 3, so it reaches the printed card, and
+       does not depend on the orchestrator's enable_validation flag.
+    2. Item 21 (main L263, L269): the card's DE genes and fold changes are the engine's
+       mapped DE genes of that pathway. The model's role text is kept for genes it named;
+       model-listed genes not mapped to the pathway are dropped (droppedGenes).
+
+    Returns counts for logging/measurement.
+    """
+    if gene_check_enabled is None:
+        gene_check_enabled = STEP3_GENE_CHECK_ENABLED
+    de_upper = {_sym(g.get('geneSymbol') or g.get('gene')) for g in genes or []}
+    de_upper.discard('')
+    by_key = {_pathway_key(ps.get('pathway', '')): ps for ps in pathway_structures or []}
+    counts = {'flagged': 0, 'removed_by_gene_check': 0, 'dropped_unmapped': 0,
+              'added_mapped': 0, 'fc_replaced': 0}
+
+    for mech in mechanisms or []:
+        ps = by_key.get(_pathway_key(mech.get('pathway', '')))
+        listed = [g for g in (mech.get('deGeneInvolvement') or []) if isinstance(g, dict)]
+
+        # 1) gene check (main L240)
+        allowed = de_upper | _retrieved_endpoints(ps)
+        flags = [g.get('gene') for g in listed if g.get('gene') and _sym(g.get('gene')) not in allowed]
+        if flags:
+            mech['geneCheckFlags'] = flags
+            counts['flagged'] += len(flags)
+            if gene_check_enabled:
+                flagged = {_sym(f) for f in flags}
+                listed = [g for g in listed if _sym(g.get('gene')) not in flagged]
+                counts['removed_by_gene_check'] += len(flags)
+                mech['deGeneInvolvement'] = listed
+
+        # 2) engine genes and fold changes (item 21)
+        if ps is None:
+            continue
+        mapped = [g for g in ps.get('mapped_de_genes', []) or []
+                  if getattr(g, 'gene_symbol', '') and getattr(g, 'direction', '') in ('up', 'down')]
+        if not mapped:
+            continue  # no DE data for this pathway: nothing computed to print
+        mapped_by_sym = {}
+        for g in mapped:
+            mapped_by_sym.setdefault(_sym(g.gene_symbol), g)
+        roles, order = {}, []
+        for g in listed:
+            s = _sym(g.get('gene'))
+            if s in mapped_by_sym and s not in roles:
+                roles[s] = g.get('roleInPathway', '') or ''
+                order.append(s)
+                fc = to_float(g.get('foldChange'))
+                if fc is None or round(fc, 2) != round(mapped_by_sym[s].fold_change, 2):
+                    counts['fc_replaced'] += 1
+        dropped = [g.get('gene') for g in listed
+                   if g.get('gene') and _sym(g.get('gene')) not in mapped_by_sym]
+        rest = sorted((s for s in mapped_by_sym if s not in roles),
+                      key=lambda s: -abs(mapped_by_sym[s].fold_change or 0))
+        counts['added_mapped'] += len(rest)
+        mech['deGeneInvolvement'] = [
+            {'gene': mapped_by_sym[s].gene_symbol, 'foldChange': mapped_by_sym[s].fold_change,
+             'roleInPathway': roles.get(s, '')}
+            for s in order + rest
+        ]
+        if dropped:
+            mech['droppedGenes'] = dropped
+            counts['dropped_unmapped'] += len(dropped)
+    return counts
+
+
+_GENE_TOKEN = re.compile(r'\b[A-Za-z][A-Za-z0-9\-]{1,14}\b')
+
+
+def _listed_only(text: str, gene: str) -> bool:
+    """True if every occurrence of `gene` is an item of a list or parenthetical, with list
+    punctuation on both sides ("(A, B)", "e.g., A, B)", "A/B/C"), so removing it leaves a
+    grammatical sentence. A clause comma ("however, A's ...") does not count."""
+    found = False
+    for m in re.finditer(rf'(?<![\w-]){re.escape(gene)}(?![\w-])', text):
+        found = True
+        before = text[:m.start()].rstrip()[-1:]
+        after = text[m.end():].lstrip()[:1]
+        if before not in ('(', ',', '/') or after not in (',', ')', '/'):
+            return False
+    return found
+
+
+def _remove_gene_tokens(text: str, genes: set) -> str:
+    """Remove named gene tokens from crosstalk text and tidy the separators left behind."""
+    for g in genes:
+        text = re.sub(rf'(?<![\w-]){re.escape(g)}(?![\w-])', '', text)
+    text = re.sub(r'\(\s*(?:e\.g\.,?\s*)?[,;/\s]*\)', '', text)       # "( , )" / "(e.g., )"
+    text = re.sub(r'\s*,\s*(?=[,)])', '', text)                      # ", ," / ", )"
+    text = re.sub(r'\(\s*,\s*', '(', text)                           # "( ,"
+    text = re.sub(r'\s+and\s*(?=[),.;])', '', text)                  # "X and )"
+    text = re.sub(r'\(\s*and\s+', '(', text)                         # "( and X"
+    text = re.sub(r'\s{2,}', ' ', text)
+    text = re.sub(r'\s+([,.;)])', r'\1', text)
+    return text.strip()
+
+
+def check_crosstalk(mechanisms: List[Dict], pathway_overlaps, pathway_structures: List[Dict],
+                    genes: List[Dict]) -> Dict:
+    """Keep the crosstalk text consistent with the computed DE-gene overlaps (item 22).
+
+    For each crosstalk line of a card, the partner pathways it names (by name) and the
+    gene symbols it names are found. A named gene that is not in the computed overlap of
+    this pathway with a named partner (or, if no partner is named, with any partner) is
+    removed when it is an item of a list, and drops the whole line when it is part of
+    the sentence (deleting it there would leave broken prose). A line naming only
+    partners with which no DE gene is shared is dropped. Counts written in the text are
+    not changed: the partner a count refers to cannot be told reliably. Changes are
+    recorded on the card (crosstalkCorrections).
+    """
+    shared = {}
+    for o in pathway_overlaps or []:
+        a, b = _pathway_key(o.pathway1), _pathway_key(o.pathway2)
+        genes_upper = {_sym(g) for g in o.shared_genes}
+        shared[(a, b)] = shared[(b, a)] = genes_upper
+    names = {_pathway_key(ps.get('pathway', '')): ps.get('pathway', '') for ps in pathway_structures or []}
+    # Gene symbols as written in the inputs. Tokens are matched with their exact casing so
+    # English words ("set", "max", "cat") are never read as genes (SET, MAX, CAT).
+    vocabulary = {str(g.get('geneSymbol') or g.get('gene') or '').strip() for g in genes or []}
+    for ps in pathway_structures or []:
+        for g in ps.get('mapped_de_genes', []) or []:
+            vocabulary.add(str(getattr(g, 'gene_symbol', '') or '').strip())
+        structure = ps.get('structure')
+        for entry in getattr(structure, 'genes', []) or []:
+            for s in getattr(entry, 'gene_symbols', None) or [getattr(entry, 'gene_symbol', None)]:
+                vocabulary.add(str(s or '').strip())
+    vocabulary.discard('')
+    counts = {'lines': 0, 'genes_removed': 0, 'lines_dropped': 0}
+
+    for mech in mechanisms or []:
+        me = _pathway_key(mech.get('pathway', ''))
+        lines = mech.get('crosstalk')
+        if not isinstance(lines, list):
+            continue
+        kept, corrections = [], []
+        for line in lines:
+            if not isinstance(line, str):
+                kept.append(line)
+                continue
+            counts['lines'] += 1
+            low = line.lower()
+            partners = [k for k, nm in names.items()
+                        if k != me and nm and nm.lower() in low]
+            # Prefer the longest names (e.g. "Ribosome biogenesis in eukaryotes" over "Ribosome").
+            partners = [k for k in partners
+                        if not any(k != o and names[k].lower() in names[o].lower() for o in partners)]
+            if partners and all(not shared.get((me, p)) for p in partners):
+                corrections.append({'line': line, 'action': 'dropped',
+                                    'reason': 'no DE gene shared with the named pathway(s)'})
+                counts['lines_dropped'] += 1
+                continue
+            allowed = set()
+            for p in partners or [k for k in names if k != me]:
+                allowed |= shared.get((me, p), set())
+            # Pathway names are removed before looking for genes: "TNF signaling pathway"
+            # names a pathway, not the gene TNF.
+            # named = {t for t in _GENE_TOKEN.findall(line) if t in vocabulary}
+            genes_text = line
+            for nm in sorted((n for n in names.values() if n), key=len, reverse=True):
+                genes_text = re.sub(re.escape(nm), ' ', genes_text, flags=re.IGNORECASE)
+            named = {t for t in _GENE_TOKEN.findall(genes_text) if t in vocabulary}
+            wrong = {t for t in named if _sym(t) not in allowed}
+            new = line
+            if wrong:
+                # Remove in place only from lists; a wrong gene that is part of the
+                # sentence itself ("DBT is the sole shared gene ...") drops the line.
+                if not all(_listed_only(line, g) for g in wrong):
+                    corrections.append({'line': line, 'action': 'dropped',
+                                        'reason': 'names a gene outside the computed overlap',
+                                        'removed_genes': sorted(wrong)})
+                    counts['lines_dropped'] += 1
+                    continue
+                new = _remove_gene_tokens(new, wrong)
+                counts['genes_removed'] += len(wrong)
+            if new != line:
+                corrections.append({'line': line, 'action': 'corrected', 'to': new,
+                                    'removed_genes': sorted(wrong)})
+            kept.append(new)
+        mech['crosstalk'] = kept
+        if corrections:
+            mech['crosstalkCorrections'] = corrections
+    return counts
+
+
+def _display(symbol: str, display_names: Optional[Dict[str, str]]) -> str:
+    """The input-cased name for an upper-case symbol (mouse names stay mouse-cased)."""
+    if not display_names:
+        return symbol
+    return display_names.get(_sym(symbol), symbol)
+
+
 def _canonicalize_mechanism_names(mechanisms: List[Dict],
                                   pathway_structures: List[Dict]) -> None:
     """Rewrite each mechanism's ``pathway`` to its retrieved structure name, in place.
@@ -116,6 +492,82 @@ def _canonicalize_mechanism_names(mechanisms: List[Dict],
         canon = canon_by_key.get(_pathway_key(mech.get('pathway') or ''))
         if canon:
             mech['pathway'] = canon
+
+
+_PATHWAY_REF_RE = re.compile(r'^\[?\s*P?\s*(\d+)\s*\]?$', re.IGNORECASE)
+
+
+def assign_pathway_refs(pathway_structures: List[Dict]) -> None:
+    """Give every retrieved pathway a short reference tag (P1, P2, ...), in place.
+
+    The tag is shown with the pathway in the prompt and the model returns it with each
+    card, so the engine, not the model's spelling of the name, decides which pathway a
+    card belongs to. Tags are global (assigned before batching) so they stay unique.
+    """
+    for i, ps in enumerate(pathway_structures or [], 1):
+        if isinstance(ps, dict) and not ps.get('ref'):
+            ps['ref'] = f'P{i}'
+
+
+def resolve_mechanism_pathways(mechanisms: List[Dict],
+                               pathway_structures: List[Dict]) -> Dict:
+    """Set each card's ``pathway`` to the retrieved pathway it belongs to, in place.
+
+    Order of evidence:
+    1. the returned ``pathwayRef`` tag -> that pathway's retrieved name (the card title
+       is then always the engine's name);
+    2. no or unknown tag -> the name the model wrote, matched exactly (case, whitespace
+       and an echoed id suffix ignored), as before;
+    3. a tag that disagrees with a name matching a *different* pathway exactly: the name
+       is used (a full exact name is the stronger signal) and the conflict is counted.
+    Cards matching nothing keep the model's name and are counted as unmatched.
+    The ``pathwayRef`` field is removed from the card after use.
+    """
+    by_ref, by_key = {}, {}
+    for ps in pathway_structures or []:
+        if not isinstance(ps, dict) or not ps.get('pathway'):
+            continue
+        if ps.get('ref'):
+            by_ref[str(ps['ref']).upper()] = ps['pathway']
+        by_key.setdefault(_pathway_key(ps['pathway']), ps['pathway'])
+    counts = {'by_ref': 0, 'by_name': 0, 'ref_name_conflict': 0, 'unmatched': 0}
+    for mech in mechanisms or []:
+        if not isinstance(mech, dict):
+            continue
+        raw_ref = mech.pop('pathwayRef', None)
+        m = _PATHWAY_REF_RE.match(str(raw_ref or '').strip())
+        ref_name = by_ref.get(f'P{int(m.group(1))}') if m else None
+        name_match = by_key.get(_pathway_key(mech.get('pathway') or ''))
+        if ref_name and name_match and name_match != ref_name:
+            counts['ref_name_conflict'] += 1
+            mech['pathway'] = name_match
+        elif ref_name:
+            counts['by_ref'] += 1
+            mech['pathway'] = ref_name
+        elif name_match:
+            counts['by_name'] += 1
+            mech['pathway'] = name_match
+        else:
+            counts['unmatched'] += 1
+    return counts
+
+
+def _relations_heading(source: str, confidence: str) -> str:
+    """Report heading for a pathway's relation list, naming only the provenance it has.
+
+    Item 18: high -> "<SOURCE> Curated" (only KEGG sets 'high', so "KEGG Curated"),
+    pc_grounded -> "Pathway Commons", inferred -> "LLM-Proposed", anything else (gene-set
+    only, unmatched) -> plain "Regulatory Relations" with no provenance claim.
+    """
+    if confidence == 'high':
+        return f'**{(source or "").upper()} Curated Regulatory Relations:**'
+    if confidence == 'pc_grounded':
+        # return '**Pathway Commons Curated Interactions:**'  # item 18: owner-specified label
+        return '**Pathway Commons Regulatory Relations:**'
+    if confidence == 'inferred':
+        # return '**Inferred Regulatory Relations (LLM-derived):**'  # item 18: owner-specified label
+        return '**LLM-Proposed Regulatory Relations:**'
+    return '**Regulatory Relations:**'
 
 
 def _structures_missing_mechanisms(mechanisms: List[Dict],
@@ -232,6 +684,8 @@ class Step03PathwayMechanisms:
         self.kegg_service = KEGGService()
         self.reactome_service = ReactomeService()
         self.pc_service = PathwayCommonsService()
+        # Full membership of non-KEGG pathways from bundled GMT files (item 19).
+        self.membership_service = PathwayMembershipService()
         # TF->target regulon for upstream-regulator inference. Lazily tolerant of a
         # missing data file (available=False) so the pipeline degrades to an LLM fallback.
         self.regulon_service = RegulonService()
@@ -285,6 +739,9 @@ class Step03PathwayMechanisms:
         )
 
         print(f'  Retrieved {len(pathway_structures)} pathway structures')
+        # The engine, not the model, names each card: every pathway gets a tag the model
+        # returns with its card (resolve_mechanism_pathways).
+        assign_pathway_refs(pathway_structures)
 
         # Calculate pathway overlaps using actual mapped DE genes
         print('\n  Calculating pathway overlaps from mapped DE genes...')
@@ -304,7 +761,9 @@ class Step03PathwayMechanisms:
             print('  ⚠️  No pathway structures retrieved. Cannot proceed with mechanism analysis.')
             return PathwayMechanismResult(
                 pathway_mechanisms=[],
-                mechanistic_summary='No pathway structures could be retrieved from KEGG.',
+                # Retrieval covers KEGG, Pathway Commons and LLM inference, so naming KEGG was wrong.
+                # mechanistic_summary='No pathway structures could be retrieved from KEGG.',
+                mechanistic_summary='No pathway structures could be retrieved.',
                 pathway_structures=[],
                 pathway_overlaps=[asdict(o) for o in pathway_overlaps],
                 report_section=self._generate_empty_report()
@@ -351,8 +810,15 @@ class Step03PathwayMechanisms:
                 # Parse JSON response
                 result = json.loads(response)
 
+            # The engine names each card from the tag the model returned, before any check
+            # that looks a card's pathway up by name (relation checks, genes, crosstalk).
+            name_counts = resolve_mechanism_pathways(
+                (result or {}).get('pathwayMechanisms') or [] if isinstance(result, dict) else [],
+                pathway_structures)
+            print(f'  Card pathway names: {name_counts}')
+
             # Validate against KEGG data
-            validated_result = self._validate_against_kegg(result, pathway_structures)
+            validated_result = self._validate_against_kegg(result, pathway_structures, genes)
 
             # Canonicalize LLM-echoed pathway names back to the retrieved structure
             # names. The model sometimes echoes the KEGG-id suffix it was shown in the
@@ -361,6 +827,17 @@ class Step03PathwayMechanisms:
             # (→ "Unverified" on the real card), and de-dup — all for the same pathway.
             _canonicalize_mechanism_names(
                 validated_result.get('pathwayMechanisms') or [], pathway_structures)
+
+            # Items 11/20 and 21: gene check and engine genes/fold changes on every card,
+            # before the report section is built so the printed cards carry the result.
+            gene_counts = normalize_card_genes(
+                validated_result.get('pathwayMechanisms') or [], pathway_structures, genes)
+            print(f'  Card genes: {gene_counts}')
+            # Item 22: crosstalk genes must come from the computed DE-gene overlaps.
+            crosstalk_counts = check_crosstalk(
+                validated_result.get('pathwayMechanisms') or [], pathway_overlaps,
+                pathway_structures, genes)
+            print(f'  Crosstalk check: {crosstalk_counts}')
 
             # Part C: ensure every retrieved structure has a mechanism entry. The
             # interpretation LLM may return nothing (unparseable/empty) or drop
@@ -746,8 +1223,17 @@ class Step03PathwayMechanisms:
         """
         structures = []
 
+        # Item 19: decide which pathway sources a bundled GMT describes, so the full
+        # membership of those pathways can be looked up (see PathwayMembershipService).
+        membership = getattr(self, 'membership_service', None)
+        if membership is not None:
+            associated = membership.associate_sources(pathways, organism)
+            if associated:
+                print(f'  GMT membership available for source(s): {associated}')
+
         for pathway in pathways:
             pathway_name = ''  # bound before any use so the except handler can't NameError
+            extras = {}
             try:
                 pathway_name = pathway.get('name') or pathway.get('pathwayName', '')
                 pathway_id = pathway.get('id', pathway.get('pathwayId', ''))
@@ -768,11 +1254,13 @@ class Step03PathwayMechanisms:
                         # blank the whole mechanisms section.
                         print(f'  [KEGG-MISS] {pathway_name}: KGML unavailable — '
                               f'using Pathway Commons/LLM fallback')
+                        self._last_pc_extras = {}
                         inferred = self._build_inferred_structure(pathway, genes, organism)
                         if not inferred:
                             print(f'  ⚠️  Could not generate fallback structure for: {pathway_name}')
                             continue
                         structure, mapped_de_genes, de_relations, confidence = inferred
+                        extras = getattr(self, '_last_pc_extras', {}) or {}
                         source = 'other'  # provenance: mechanism came from PC/LLM, not KEGG
                     else:
                         mapped_de_genes = self.kegg_service.map_de_genes_to_pathway(structure, genes)
@@ -781,28 +1269,45 @@ class Step03PathwayMechanisms:
                         if not mapped_de_genes and structure.genes:
                             # No DE genes but KEGG structure has gene entries — use them as placeholders
                             print(f'    ℹ️  No DE genes mapped — using {len(structure.genes)} KEGG pathway genes')
-                            mapped_de_genes = [
-                                MappedDEGene(
-                                    pathway_entry_id=entry.id,
-                                    gene_symbol=entry.gene_symbol or entry.name,
-                                    kegg_names=entry.names,
-                                    fold_change=0.0,
-                                    p_value=1.0,
-                                    direction='unknown'
-                                )
-                                for entry in structure.genes[:30]
-                                if entry.gene_symbol
-                            ]
+                            # Every gene of a multi-gene box (item 17), not just the first;
+                            # still capped at 30 placeholders, each symbol once.
+                            # mapped_de_genes = [MappedDEGene(..., gene_symbol=entry.gene_symbol
+                            #     or entry.name, ...) for entry in structure.genes[:30]
+                            #     if entry.gene_symbol]  # first gene of each box only
+                            mapped_de_genes, seen_syms = [], set()
+                            for entry in structure.genes:
+                                for sym in entry_symbols(entry):
+                                    if len(mapped_de_genes) >= 30 or _sym(sym) in seen_syms:
+                                        continue
+                                    seen_syms.add(_sym(sym))
+                                    mapped_de_genes.append(MappedDEGene(
+                                        pathway_entry_id=entry.id,
+                                        gene_symbol=sym,
+                                        kegg_names=entry.names,
+                                        fold_change=0.0,
+                                        p_value=1.0,
+                                        direction='unknown'))
                             confidence = 'gene_set'  # KEGG structure but no DE data
                         else:
                             confidence = 'high'  # Curated data with DE genes
 
                 else:  # source == 'other'
+                    self._last_pc_extras = {}
                     inferred = self._build_inferred_structure(pathway, genes, organism)
                     if not inferred:
                         print(f'  ⚠️  Could not generate LLM structure for: {pathway_name}')
                         continue
                     structure, mapped_de_genes, de_relations, confidence = inferred
+                    extras = getattr(self, '_last_pc_extras', {}) or {}
+
+                if source != 'kegg' and not extras.get('pc_interactions'):
+                    # LLM-proposed relations (native non-KEGG pathways and KEGG misses):
+                    # at least one end must be an input gene.
+                    de_relations, dropped_llm = filter_llm_relations(
+                        de_relations, _input_gene_set(genes))
+                    if dropped_llm:
+                        print(f'    ⚠️  Dropped {len(dropped_llm)} LLM-proposed relation(s) '
+                              f'with no input gene at either end ({pathway_name})')
 
                 # Capture enrichment score, metric (NES preferred) and direction
                 es_value, es_metric = _enrichment_metric(pathway)
@@ -827,7 +1332,12 @@ class Step03PathwayMechanisms:
                     'p_value_fdr': pathway.get('pValueFDR'),
                     'enrichment_score': es_value,
                     'enrichment_metric': es_metric,
-                    'enrichment_direction': enrichment_direction
+                    'enrichment_direction': enrichment_direction,
+                    # Item 19: the retrieved PC interactions (upper-case, filtered), the
+                    # upper -> input-casing map for display, and the retrieval counts.
+                    'pc_interactions': extras.get('pc_interactions', []),
+                    'display_names': extras.get('display_names', {}),
+                    'pc_stats': extras.get('pc_stats', {}),
                 })
 
                 print(f'    ✓ [{source.upper()}] {pathway_name}: {len(mapped_de_genes)} DE genes, '
@@ -888,13 +1398,47 @@ class Step03PathwayMechanisms:
         pathway_name = pathway.get('name') or pathway.get('pathwayName', '')
         pathway_genes = pathway.get('genes', [])
 
-        # Query Pathway Commons for curated gene interactions (grounding for the LLM)
-        pc_interactions = self.pc_service.get_interactions_between(pathway_genes)
-        if pc_interactions:
-            print(f'  [LLM+PC] Processing: {pathway_name} ({len(pc_interactions)} curated interactions)')
-        else:
-            print(f'  [LLM] Processing: {pathway_name} (no curated interactions found)')
+        # Main L236: retrieve the Pathway Commons interactions for ALL pathway genes.
+        # Full membership comes from a bundled GMT when one applies; otherwise the genes
+        # the website sent (W6 sends only DE members). Symbols are queried and compared
+        # upper-case, because PC's graph endpoint resolves only upper-case symbols (a
+        # mouse-cased query returns nothing); input casing is kept for display.
+        membership = getattr(self, 'membership_service', None)
+        gmt_members = membership.members(pathway) if membership is not None else None
+        members = list(gmt_members) if gmt_members else list(pathway_genes)
+        de_symbols = [g.get('geneSymbol') or g.get('gene') or '' for g in genes or []]
+        display_names = {}
+        # The input's DE spelling wins, then the membership's (it may come from a GMT).
+        # for name in list(members) + [s for s in de_symbols if s]:  # GMT casing won
+        for name in [s for s in de_symbols if s] + list(members):
+            display_names.setdefault(_sym(name), name)
+        members_upper = {_sym(g) for g in members if g}
+        de_upper = {_sym(s) for s in de_symbols if s}
+        query = sorted(members_upper)
 
+        raw_interactions = self.pc_service.get_interactions_between(query)
+        pc_relations, pc_stats = filter_pc_interactions(raw_interactions, members_upper, de_upper)
+        pc_stats.update({'members': len(members_upper),
+                         'membership_source': 'gmt' if gmt_members else 'input'})
+
+        if pc_relations:
+            # Retrieved relations exist: they are this pathway's relations, extracted the
+            # same way as for KEGG (DE gene at one end). No per-pathway inference call.
+            print(f'  [PC] Processing: {pathway_name} ({len(pc_relations)} of '
+                  f'{pc_stats["retrieved"]} Pathway Commons interactions kept)')
+            mapped_de_genes = self._map_de_genes_to_pathway({'genes': members}, genes)
+            structure = PCStructure(id=pathway.get('id', pathway_name), name=pathway_name,
+                                    organism=organism)
+            self._last_pc_extras = {'pc_interactions': pc_relations,
+                                    'display_names': display_names, 'pc_stats': pc_stats}
+            return structure, mapped_de_genes, list(pc_relations), 'pc_grounded'
+
+        print(f'  [LLM] Processing: {pathway_name} (no Pathway Commons interaction retrieved)')
+        self._last_pc_extras = {'pc_interactions': [], 'display_names': display_names,
+                                'pc_stats': pc_stats}
+        # Nothing retrieved: the inferred path is unchanged (decision D3 keeps the
+        # model's inferred relations for these pathways).
+        pc_interactions = []
         llm_structure = self._get_llm_pathway_structure(
             pathway, genes, organism, pc_interactions=pc_interactions
         )
@@ -937,12 +1481,14 @@ class Step03PathwayMechanisms:
         Returns:
             List of MappedDEGene objects for genes in this pathway
         """
-        pathway_genes = set(pathway.get('genes', []))
+        # Case-insensitive on both sides (mouse vs upper-case symbols); the DE gene's own
+        # casing is kept.
+        pathway_genes = {_sym(g) for g in pathway.get('genes', []) or []}
         mapped_genes = []
 
         for gene in genes:
             gene_symbol = gene.get('geneSymbol', '')
-            if gene_symbol in pathway_genes:
+            if gene_symbol and _sym(gene_symbol) in pathway_genes:
                 fc = gene.get('foldChange', 0)
                 mapped_genes.append(MappedDEGene(
                     pathway_entry_id='',
@@ -1052,9 +1598,8 @@ Note: No differential expression data available. Analyze mechanisms based on gen
 **Reference: Curated gene interactions from Pathway Commons (KEGG, Reactome, WikiPathways, etc.):**
 {chr(10).join(relations_text)}
 
-Use these curated interactions as grounding when relevant to the genes in this pathway.
-Prioritize these known relationships over speculation.
-Do NOT fabricate interactions for genes not listed above.
+Use ONLY the genes and interactions listed above.
+Do NOT infer relationships not shown in this list.
 """
 
         user_prompt = f"""**Pathway:** {pathway_name}
@@ -1170,8 +1715,9 @@ You will receive pathways from different sources:
 
 2. **PC-GROUNDED pathways** (non-KEGG with Pathway Commons interactions):
    - Provided with curated interactions from Pathway Commons (22+ databases)
-   - Your role: Use these curated interactions as grounding for mechanism inference
-   - Prioritize known relationships over speculation
+   - Your role: INTERPRET these interactions, NOT generate mechanisms
+   - Use ONLY the genes and interactions provided
+   - Do NOT infer relationships not shown in the data
 
 3. **INFERRED pathways** (GO, MitoCarta, MSigDB, custom without PC data):
    - Provided with gene sets but NO curated relationships
@@ -1203,9 +1749,19 @@ RESPONSE FORMAT:
         themes: Optional[List[Dict]] = None
     ) -> str:
         """Build user prompt for LLM with pathway data"""
-        prompt_parts = [
-            'Interpret these curated KEGG pathway structures in light of differentially expressed genes:\n\n'
-        ]
+        # The KEGG wording below asserts a KEGG structure is in the context and asks the model
+        # to cite it. That is only true when every pathway in the batch came from KEGG; for
+        # GO / Reactome / custom gene sets / PC / LLM fallbacks it invited fabricated "KEGG"
+        # claims. All-KEGG batches keep the original wording unchanged.
+        all_kegg = bool(pathway_structures) and all(
+            ps.get('source', 'kegg') == 'kegg' for ps in pathway_structures)
+        if all_kegg:
+            intro = 'Interpret these curated KEGG pathway structures in light of differentially expressed genes:\n\n'
+        else:
+            intro = ('Interpret these pathways in light of differentially expressed genes. Each pathway is '
+                     'marked with its evidence source ([CURATED], [PC-GROUNDED], [INFERRED] or [GENE-SET]); '
+                     'cite only the structure or relations actually shown for it:\n\n')
+        prompt_parts = [intro]
 
         # Add biological themes from Step 1 for context
         if themes:
@@ -1226,19 +1782,70 @@ RESPONSE FORMAT:
             prompt_parts.append(self._format_pathway_structure_for_llm(ps))
             prompt_parts.append('\n---\n')
 
-        # Add pathway overlaps
-        prompt_parts.append('\n**Pathway Gene Overlaps (Quantitative Crosstalk Evidence):**\n')
-        for overlap in pathway_overlaps[:10]:
-            hub_genes_text = ''
-            if overlap.shared_hub_genes:
-                hub_genes_text = f' [Hub genes: {", ".join(overlap.shared_hub_genes[:3])}]'
+        # Add pathway overlaps: for each pathway in this batch, every partner it shares DE
+        # genes with, naming the shared genes (item 22, main L238 / suppl L256). The former
+        # global top-10 pairs, as counts only, were the same for every batch.
+        # for overlap in pathway_overlaps[:10]:  # replaced: per-pathway lists with gene names
+        prompt_parts.append('\n**Pathway Gene Overlaps (shared DE genes; the only basis for crosstalk):**\n')
+        for ps in pathway_structures:
+            name = ps.get('pathway', '')
+            partners = [o for o in pathway_overlaps
+                        if _pathway_key(name) in (_pathway_key(o.pathway1), _pathway_key(o.pathway2))]
+            if not partners:
+                continue
+            prompt_parts.append(f'- {name}:\n')
+            for o in partners:
+                other = o.pathway2 if _pathway_key(o.pathway1) == _pathway_key(name) else o.pathway1
+                hub_genes_text = (f' [Hub genes: {", ".join(sorted(o.shared_hub_genes))}]'
+                                  if o.shared_hub_genes else '')
+                prompt_parts.append(
+                    f'  - ↔ {other}: {o.shared_genes_count} shared DE gene(s): '
+                    f'{", ".join(sorted(o.shared_genes))}{hub_genes_text}\n')
 
-            prompt_parts.append(
-                f'- {overlap.pathway1} ↔ {overlap.pathway2}: '
-                f'{overlap.shared_genes_count} shared DE genes{hub_genes_text}\n'
-            )
+        # Add instructions. `curatedRelations` keeps its name for every source (renaming it
+        # touches step 4, step 6, the validators and the orchestrator); provenance is carried
+        # by each pathway's source/confidence instead, and the report heading reads that.
+        if not all_kegg:
+            prompt_parts.append('''
+For each pathway, provide interpretation:
+1. **Biological function** - Summarize what this pathway does (from the structure or gene set provided)
+2. **DE gene involvement** - Which DE genes participate and their roles
+3. **Regulatory relationships** - Which provided relations involve DE genes (activation/inhibition); for [INFERRED] or [GENE-SET] pathways, include only well-established relationships and do not attribute them to a database
+4. **Crosstalk mechanisms** - How shared genes connect pathways (use overlap data)
+5. **Functional consequences** - What biological effects result from these gene changes
 
-        # Add instructions
+Return JSON:
+{
+  "pathwayMechanisms": [
+    {
+      "pathwayRef": "the tag shown for the pathway, e.g. P1",
+      "pathway": "pathway name exactly as shown",
+      "biologicalFunction": "What it does (2-3 sentences)",
+      "deGeneInvolvement": [
+        {
+          "gene": "GENE_NAME",
+          "foldChange": FC_VALUE,
+          "roleInPathway": "What this gene does in the pathway (from the data provided)"
+        }
+      ],
+      "curatedRelations": [
+        {
+          "source": "GENE1",
+          "target": "GENE2",
+          "type": "activation/inhibition/phosphorylation",
+          "isDE": true/false,
+          "interpretation": "Functional consequence of this relation"
+        }
+      ],
+      "crosstalk": ["How this pathway connects to others via shared genes"],
+      "functionalConsequences": "Predicted biological outcomes (2-3 sentences)"
+    }
+  ],
+  "mechanisticSummary": "Overall interpretation citing the provided relations and DE gene patterns (4-5 sentences)"
+}
+''')
+            return ''.join(prompt_parts)
+
         prompt_parts.append('''
 For each pathway, provide interpretation:
 1. **Biological function** - Summarize what this pathway does (from KEGG structure)
@@ -1251,7 +1858,8 @@ Return JSON:
 {
   "pathwayMechanisms": [
     {
-      "pathway": "pathway name",
+      "pathwayRef": "the tag shown for the pathway, e.g. P1",
+      "pathway": "pathway name exactly as shown",
       "biologicalFunction": "What it does (2-3 sentences)",
       "deGeneInvolvement": [
         {
@@ -1292,15 +1900,19 @@ Return JSON:
             'NES' if (es_value is not None and abs(es_value) > 1.0) else 'ES')
         enrichment_dir = pathway_structure.get('enrichment_direction')
 
+        # The tag the model returns with this pathway's card (pathwayRef), so the engine
+        # names the card rather than the model's spelling of the pathway.
+        ref = pathway_structure.get('ref')
+        label = f'Pathway {ref}' if ref else 'Pathway'
         # Format header based on source and confidence
         if source == 'kegg' and confidence != 'gene_set':
-            formatted = [f'**Pathway: {pathway}** (KEGG: {structure.id}) [CURATED]\n']
+            formatted = [f'**{label}: {pathway}** (KEGG: {structure.id}) [CURATED]\n']
         elif confidence == 'pc_grounded':
-            formatted = [f'**Pathway: {pathway}** ({source.upper()}: {structure.id}) [PC-GROUNDED]\n']
+            formatted = [f'**{label}: {pathway}** ({source.upper()}: {structure.id}) [PC-GROUNDED]\n']
         elif confidence == 'gene_set':
-            formatted = [f'**Pathway: {pathway}** ({source.upper()}: {structure.id}) [GENE-SET]\n']
+            formatted = [f'**{label}: {pathway}** ({source.upper()}: {structure.id}) [GENE-SET]\n']
         else:  # other (inferred)
-            formatted = [f'**Pathway: {pathway}** ({source.upper()}: {structure.id}) [INFERRED]\n']
+            formatted = [f'**{label}: {pathway}** ({source.upper()}: {structure.id}) [INFERRED]\n']
 
         # Add enrichment score context if available (labelled by actual metric)
         if es_value is not None:
@@ -1328,12 +1940,17 @@ Return JSON:
             if confidence == 'high':
                 formatted.append(f'**{source.upper()} Curated Relations (involving DE genes):**\n')
             elif confidence == 'pc_grounded':
-                formatted.append(f'**PC-Grounded Relations (involving DE genes):**\n')
+                formatted.append(f'**Pathway Commons Interactions (involving DE genes):**\n')
             else:
                 formatted.append(f'**Inferred Relations (from LLM knowledge):**\n')
 
+            # Symbols shown in the input casing (e.g. mouse "Ndufs1", not the upper-case
+            # form Pathway Commons was queried with), so the gene list and the relations
+            # name each gene the same way.
+            display_names = pathway_structure.get('display_names') or {}
             for rel in de_relations:
-                formatted.append(f'- {rel.source} --[{rel.subtype}]--> {rel.target}\n')
+                formatted.append(f'- {_display(rel.source, display_names)} --[{rel.subtype}]--> '
+                                 f'{_display(rel.target, display_names)}\n')
             formatted.append('\n')
         else:
             if confidence == 'high':
@@ -1355,21 +1972,33 @@ Return JSON:
         """Calculate gene overlaps between pathways based on mapped DE genes"""
         overlaps = []
 
-        # Create gene sets for each pathway from mapped DE genes
+        # Create gene sets for each pathway from its mapped DE genes. Gene-set placeholders
+        # (direction 'unknown', no DE data) are not DE genes and are excluded, so crosstalk
+        # is computed only "through their common DE genes" (main L238, item 22).
+        # Compared upper-case: KEGG-mapped genes carry KEGG's spelling ("Mcm2") while
+        # other pathways carry the input's ("MCM2"); the first spelling seen is shown.
         pathway_gene_sets = {}
+        display = {}
         for ps in pathway_structures:
             pathway_name = ps['pathway']
-            # Get gene symbols from mapped DE genes
-            gene_symbols = {g.gene_symbol for g in ps['mapped_de_genes']}
+            # gene_symbols = {g.gene_symbol for g in ps['mapped_de_genes'] ...}  # case-sensitive
+            gene_symbols = set()
+            for g in ps['mapped_de_genes']:
+                if getattr(g, 'direction', '') in ('up', 'down') and g.gene_symbol:
+                    gene_symbols.add(_sym(g.gene_symbol))
+                    display.setdefault(_sym(g.gene_symbol), g.gene_symbol)
             pathway_gene_sets[pathway_name] = gene_symbols
+        hub_upper = {_sym(h) for h in hub_genes or []}
 
         # Calculate pairwise overlaps
         pathway_names = list(pathway_gene_sets.keys())
         for i, pathway1 in enumerate(pathway_names):
             for pathway2 in pathway_names[i + 1:]:
-                shared = pathway_gene_sets[pathway1] & pathway_gene_sets[pathway2]
+                shared_upper = pathway_gene_sets[pathway1] & pathway_gene_sets[pathway2]
+                shared = {display[s] for s in shared_upper}
                 if shared:
-                    shared_hub = [g for g in shared if g in hub_genes]
+                    # shared_hub = [g for g in shared if g in hub_genes]  # case-sensitive
+                    shared_hub = [g for g in shared if _sym(g) in hub_upper]
 
                     overlaps.append(PathwayOverlap(
                         pathway1=pathway1,
@@ -1387,7 +2016,8 @@ Return JSON:
     def _validate_against_kegg(
         self,
         result: Dict,
-        pathway_structures: List[Dict]
+        pathway_structures: List[Dict],
+        input_genes: Optional[List[Dict]] = None
     ) -> Dict:
         """Validate/clean LLM output against KEGG curated data.
 
@@ -1445,7 +2075,53 @@ Return JSON:
         if result.get('mechanisticSummary'):
             result['mechanisticSummary'] = sanitize_llm_text(result['mechanisticSummary'])
 
+        # Retrieved relation set per pathway (main L240: "removes every relation that is
+        # not among the retrieved KEGG relations or Pathway Commons interactions").
+        reference_by_key = {}
+        llm_proposed_keys = set()
+        for ps in pathway_structures:
+            ref = _relation_reference(ps)
+            if ref is not None:
+                reference_by_key[_pathway_key(ps.get('pathway', ''))] = ref
+            elif ps.get('source') != 'kegg':
+                llm_proposed_keys.add(_pathway_key(ps.get('pathway', '')))
+        input_upper = _input_gene_set(input_genes)
+
         for mech in result.get('pathwayMechanisms') or []:
+            # 0) Pair check: keep a listed relation only if its gene pair was retrieved for
+            #    this pathway. Pathways with nothing retrieved keep their relations (D3).
+            ref = reference_by_key.get(_pathway_key(mech.get('pathway', '')))
+            rels = mech.get('curatedRelations')
+            # 0b) LLM-proposed relations (nothing retrieved): keep only those with at
+            #     least one input gene at either end (owner decision 2026-11-02).
+            if (ref is None and isinstance(rels, list)
+                    and _pathway_key(mech.get('pathway', '')) in llm_proposed_keys):
+                kept, dropped = filter_llm_relations(
+                    [r for r in rels if isinstance(r, dict)], input_upper)
+                for d in dropped:
+                    print(f'    ⚠️  Dropping LLM-proposed relation with no input gene: '
+                          f'{d.get("source")} → {d.get("target")} ({mech.get("pathway")})')
+                mech['curatedRelations'] = kept
+                if dropped:
+                    mech['droppedRelations'] = [
+                        {'source': d.get('source'), 'target': d.get('target'),
+                         'type': d.get('type'), 'reference': 'input_genes'} for d in dropped]
+            if ref is not None and isinstance(rels, list):
+                kept, dropped = [], []
+                for rel in rels:
+                    if isinstance(rel, dict) and _relation_in_reference(
+                            rel.get('source'), rel.get('target'), ref):
+                        kept.append(rel)
+                    elif isinstance(rel, dict):
+                        dropped.append({'source': rel.get('source'), 'target': rel.get('target'),
+                                        'type': rel.get('type'), 'reference': ref[0]})
+                for d in dropped:
+                    print(f'    ⚠️  Dropping relation not among the retrieved {d["reference"]} '
+                          f'relations: {d["source"]} → {d["target"]} ({mech.get("pathway")})')
+                mech['curatedRelations'] = kept
+                if dropped:
+                    mech['droppedRelations'] = dropped
+
             # 1) Filter hallucinated relation endpoints — but only for pathways whose
             #    structure gave us a real inventory to validate against.
             can_validate = _pathway_key(mech.get('pathway', '')) in pathways_with_inventory
@@ -1685,6 +2361,7 @@ Return JSON:
 
     def _pathway_structure_to_dict(self, ps: Dict) -> Dict:
         """Convert pathway structure to serializable dict"""
+        display_names = ps.get('display_names') or {}
         result = {
             'pathway': ps['pathway'],
             'pathway_id': ps['pathway_id'],
@@ -1703,16 +2380,28 @@ Return JSON:
                 }
                 for g in ps['mapped_de_genes']
             ],
+            # Shown to Step 4 through the tool results, so in the input casing; every
+            # comparison upper-cases both sides.
             'de_relations': [
                 {
-                    'source': r.source,
-                    'target': r.target,
+                    'source': _display(r.source, display_names),
+                    'target': _display(r.target, display_names),
                     'type': r.type,
                     'subtype': r.subtype
                 }
                 for r in ps['de_relations']
             ]
         }
+        # Item 19: the retrieved Pathway Commons interactions (canonical upper-case form,
+        # the reference for the Step 3 pair check and the Step 4 relation check) and the
+        # retrieval counts.
+        if ps.get('pc_interactions'):
+            result['pc_interactions'] = [
+                {'source': r.source, 'target': r.target, 'type': r.subtype}
+                for r in ps['pc_interactions']
+            ]
+        if ps.get('pc_stats'):
+            result['pc_stats'] = ps['pc_stats']
 
         # Add enrichment score fields if present
         if 'enrichment_score' in ps and ps['enrichment_score'] is not None:
@@ -1827,17 +2516,20 @@ Return JSON:
                     lines.append(f'- **{gene}**{fc_txt}{suffix}\n')
                 lines.append('\n')
 
-            # Curated relations
+            # Regulatory relations. The field is named curatedRelations for every source, so
+            # the heading is chosen from the pathway's actual provenance, not the field name.
             relations = mechanism.get('curatedRelations', [])
             if relations:
-                lines.append('**KEGG Curated Regulatory Relations:**\n\n')
+                # lines.append('**KEGG Curated Regulatory Relations:**\n\n')  # claimed KEGG for every source
+                lines.append(f'{_relations_heading(source, confidence)}\n\n')
                 for rel in relations:
-                    source = rel.get('source', '')
+                    # rel_source, not source: `source` is the pathway's database above.
+                    rel_source = rel.get('source', '')
                     target = rel.get('target', '')
                     rel_type = rel.get('type', '')
                     interp = (rel.get('interpretation') or '').strip()
                     suffix = f': {interp}' if interp else ''
-                    lines.append(f'- {source} --[{rel_type}]--> {target}{suffix}\n')
+                    lines.append(f'- {rel_source} --[{rel_type}]--> {target}{suffix}\n')
                 lines.append('\n')
 
             # Crosstalk mechanisms
@@ -1885,8 +2577,9 @@ Return JSON:
         """
         mechanisms = []
         for ps in pathway_structures:
+            display_names = ps.get('display_names') or {}
             de_symbols = {
-                g.gene_symbol for g in ps.get('mapped_de_genes', [])
+                _sym(g.gene_symbol) for g in ps.get('mapped_de_genes', [])
                 if getattr(g, 'gene_symbol', '') and getattr(g, 'direction', '') in ('up', 'down')
             }
             de_gene_involvement = _dedupe_de_genes([
@@ -1900,10 +2593,10 @@ Return JSON:
             ])
             curated_relations = [
                 {
-                    'source': r.source,
-                    'target': r.target,
+                    'source': _display(r.source, display_names),
+                    'target': _display(r.target, display_names),
                     'type': getattr(r, 'subtype', '') or getattr(r, 'type', ''),
-                    'isDE': r.source in de_symbols and r.target in de_symbols,
+                    'isDE': _sym(r.source) in de_symbols and _sym(r.target) in de_symbols,
                     'interpretation': ''
                 }
                 for r in ps.get('de_relations', [])
@@ -1944,7 +2637,8 @@ Return JSON:
 
     def _generate_empty_report(self) -> str:
         """Generate empty report when no pathways found"""
+        # Was "...retrieved from KEGG for analysis." — retrieval is not KEGG-only.
         return '''## Pathway Mechanisms and Interactions
 
-No pathway structures could be retrieved from KEGG for analysis.
+No pathway structures could be retrieved for analysis.
 '''
