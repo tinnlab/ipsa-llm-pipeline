@@ -7,6 +7,7 @@ Coordinates execution of all pipeline steps and manages data flow between them.
 import json
 import time
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Any, Optional
 from dataclasses import asdict
@@ -15,19 +16,27 @@ from .steps.step01_pathway_themes import Step01PathwayThemes
 from .steps.step02_hub_genes import Step02HubGenes
 from .steps.step03_pathway_mechanisms import Step03PathwayMechanisms
 from .steps.step04_hypothesis_generation import Step04HypothesisGeneration
+# Step 5 (Therapeutic Implications) removed from the pipeline — module retained on disk.
+# from .steps.step05_therapeutic_implications import Step05TherapeuticImplications
 from .steps.step06_report_generation import Step06ReportGeneration
 from .services.step_validators import StepValidators
 from .services.baseline_comparison_service import BaselineComparisonService
 from ..api.job_manager import job_manager
+from ..agents import prompt_log
 from ..config import settings
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+def _utc_now() -> str:
+    """UTC timestamp for the prompt-log run manifest."""
+    return datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+
+
 class PipelineOrchestrator:
     """
-    Orchestrates the full 5-step biological analysis pipeline.
+    Orchestrates the full 6-step biological analysis pipeline.
 
     Manages data flow between steps, saves outputs, and handles errors.
     Optionally validates step outputs to catch LLM hallucinations.
@@ -57,6 +66,7 @@ class PipelineOrchestrator:
         self.step2 = Step02HubGenes()
         self.step3 = Step03PathwayMechanisms()
         self.step4 = Step04HypothesisGeneration()
+        # Step 5 (Therapeutic Implications) removed from the pipeline; not instantiated.
         self.step6 = Step06ReportGeneration()
 
     def _get_filtered_pathways_from_step1(
@@ -140,7 +150,7 @@ class PipelineOrchestrator:
         tracking_job_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """
-        Run the full 5-step pipeline.
+        Run the full 6-step pipeline.
 
         Args:
             input_data: Pipeline input containing genes, pathways, disease info
@@ -151,6 +161,44 @@ class PipelineOrchestrator:
         Returns:
             Dictionary containing all step results and execution metadata
         """
+        metadata = input_data.get('metadata') if isinstance(input_data, dict) else None
+        ids = prompt_log.extract_ids(metadata)
+
+        # Run the steps on input whose metadata no longer carries the routing ids.
+        #
+        # The ids are addressing information for the prompt log, but `metadata` is NOT inert:
+        # every non-organism key is copied into `context` below and rendered straight into step
+        # prompts, and Step 5's report builds its title from raw metadata keys. Leaving them in
+        # would inject opaque database ids into every prompt and into the report — changing
+        # model input for the sake of observability, which is the opposite of the point (and
+        # doubly unwelcome while run-to-run variation is an open question). `input_data.json`
+        # is still written from the ORIGINAL input, so what the caller sent is still on record.
+        clean_input = input_data
+        if isinstance(input_data, dict) and any(ids.values()):
+            clean_input = dict(input_data)
+            clean_input['metadata'] = prompt_log.strip_ids(metadata)
+
+        # The meta-pipeline's nested run passes job_id='meta_analysis' with the real API job id
+        # in tracking_job_id, so prefer the latter for the log's job_id fallback bucket.
+        with prompt_log.log_context(job_id=tracking_job_id or job_id, **ids):
+            prompt_log.write_manifest({
+                'pipeline': 'full',
+                'output_dir': str(self.output_dir / job_id),
+            })
+            try:
+                return self._run_full_pipeline(
+                    clean_input, job_id, tracking_job_id, input_data_for_save=input_data)
+            finally:
+                prompt_log.write_manifest({'finished_at': _utc_now()})
+
+    def _run_full_pipeline(
+        self,
+        input_data: Dict[str, Any],
+        job_id: str,
+        tracking_job_id: Optional[str] = None,
+        input_data_for_save: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """Body of `run_full_pipeline`, run inside the prompt-log context it sets up."""
         start_time = time.time()
         progress_id = tracking_job_id or job_id
         job_output_dir = self.output_dir / job_id
@@ -159,10 +207,12 @@ class PipelineOrchestrator:
         logger.info(f"Starting pipeline execution for job {job_id}")
         logger.info(f"Output directory: {job_output_dir}")
 
-        # Save input data to job directory for reproducibility
+        # Save input data to job directory for reproducibility. Deliberately the caller's
+        # ORIGINAL input, ids included — the steps run on a copy with them stripped.
         input_file = job_output_dir / 'input_data.json'
         with open(input_file, 'w') as f:
-            json.dump(input_data, f, indent=2)
+            json.dump(input_data_for_save if input_data_for_save is not None else input_data,
+                      f, indent=2)
         logger.info(f"Input data saved to: {input_file}")
 
         # Extract input components
@@ -190,7 +240,7 @@ class PipelineOrchestrator:
         has_genes = genes and len(genes) > 0
         if not has_genes:
             logger.info("\n⚠️  Note: No DE genes provided in input")
-            logger.info("   Steps 2 (Hub Genes) and 3 (Pathway Mechanisms) will be skipped")
+            logger.info("   Steps 2 (Hub Genes), 3 (Pathway Mechanisms), and 5 (Therapeutics) will be skipped")
             logger.info("   Pipeline will run with pathway-only analysis\n")
 
         # Build input summary with all metadata fields (dynamic, not hardcoded)
@@ -216,6 +266,7 @@ class PipelineOrchestrator:
             # Step 1: Pathway Themes
             step_start = time.time()
             job_manager.set_current_step(progress_id, 1)
+            prompt_log.set_step('step1')
             logger.info("\n" + "=" * 80)
             logger.info("STEP 1: Pathway Theme Identification")
             logger.info("=" * 80)
@@ -258,6 +309,7 @@ class PipelineOrchestrator:
             # Step 2: Hub Genes (skip if no genes provided)
             step_start = time.time()
             job_manager.set_current_step(progress_id, 2)
+            prompt_log.set_step('step2')
             logger.info("\n" + "=" * 80)
             logger.info("STEP 2: Hub Gene Detection")
             logger.info("=" * 80)
@@ -313,6 +365,7 @@ class PipelineOrchestrator:
             # Step 3: Pathway Mechanisms (skip if no genes provided)
             step_start = time.time()
             job_manager.set_current_step(progress_id, 3)
+            prompt_log.set_step('step3')
             logger.info("\n" + "=" * 80)
             logger.info("STEP 3: Pathway Mechanisms")
             logger.info("=" * 80)
@@ -407,6 +460,7 @@ class PipelineOrchestrator:
             # Step 4: Hypothesis Generation
             step_start = time.time()
             job_manager.set_current_step(progress_id, 4)
+            prompt_log.set_step('step4')
             logger.info("\n" + "=" * 80)
             logger.info("STEP 4: Hypothesis Generation")
             logger.info("=" * 80)
@@ -481,9 +535,14 @@ class PipelineOrchestrator:
                     except Exception as e:
                         logger.warning(f"Baseline comparison ({provider}) failed: {e}")
 
-            # Step 5: Final Report Generation (the last step)
+            # Step 5 (Therapeutic Implications) has been removed from the pipeline.
+            # The implementation is retained in step05_therapeutic_implications.py but is
+            # intentionally not wired in; the pipeline goes straight from Step 4 to Step 5.
+
+            # Step 5: Final Report Generation (last step; previously numbered 6)
             step_start = time.time()
             job_manager.set_current_step(progress_id, 5)
+            prompt_log.set_step('step5')
             logger.info("\n" + "=" * 80)
             logger.info("STEP 5: Final Report Generation")
             logger.info("=" * 80)
@@ -497,9 +556,6 @@ class PipelineOrchestrator:
             )
 
             step6_dict = self._to_dict(step6_output)
-            # `step5` is the report. Report generation was originally step 6; it moved into
-            # the step-5 slot when the pipeline shrank. The key is deliberately kept as
-            # `step5` because API consumers read `results.steps.step5.markdown_content`.
             self._save_step_output(job_output_dir, 5, step6_dict)
             results['steps']['step5'] = step6_dict
             step6_time = time.time() - step_start
@@ -571,14 +627,33 @@ class PipelineOrchestrator:
         Run a single pipeline step.
 
         Args:
-            step_number: Step number to run (1-5)
+            step_number: Step number to run (1-6)
             input_data: Pipeline input data
-            previous_results: Results from previous steps (required for steps 2-5)
+            previous_results: Results from previous steps (required for steps 2-6)
             job_id: Optional job ID for output organization
 
         Returns:
             Dictionary containing step results and execution metadata
         """
+        metadata = input_data.get('metadata') if isinstance(input_data, dict) else None
+        ids = prompt_log.extract_ids(metadata)
+        if isinstance(input_data, dict) and any(ids.values()):
+            # Same reason as run_full_pipeline: the ids must not reach the prompts.
+            input_data = {**input_data, 'metadata': prompt_log.strip_ids(metadata)}
+
+        with prompt_log.log_context(
+            job_id=job_id or 'single-step', step=f'step{step_number}', **ids
+        ):
+            return self._run_single_step(step_number, input_data, previous_results, job_id)
+
+    def _run_single_step(
+        self,
+        step_number: int,
+        input_data: Dict[str, Any],
+        previous_results: Optional[Dict[str, Any]] = None,
+        job_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Body of `run_single_step`, run inside the prompt-log context it sets up."""
         if step_number < 1 or step_number > 5:
             raise ValueError(f"Invalid step number: {step_number}. Must be 1-5.")
 
@@ -667,9 +742,13 @@ class PipelineOrchestrator:
                     mechanisms_result=step3_dict
                 )
             else:  # step_number == 5 (Final Report Generation; previously step 6)
+                # The cleaned Step 2 and Step 3 copies (item 11), not the raw outputs, as
+                # every single-step run here uses (steps 2-4 above). run_full_pipeline
+                # cleans them only when enable_validation is on. Step 1 and Step 4 are
+                # passed as the full pipeline passes them.
                 step1_dict = previous_results['steps']['step1']
-                step2_dict = previous_results['steps']['step2']
-                step3_dict = previous_results['steps']['step3']
+                step2_dict = _clean_prior(2, 'step2')
+                step3_dict = _clean_prior(3, 'step3', extra_genes=_pathway_genes_from_step3())
                 step4_dict = previous_results['steps']['step4']
                 output = self.step6.execute(
                     input_data=input_data,

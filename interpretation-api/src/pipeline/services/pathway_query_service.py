@@ -73,8 +73,11 @@ class PathwayQueryService:
             self.overlap_index[(pw2, pw1)] = overlap
 
     def _normalize_pathway_name(self, pathway: str) -> str:
-        """Normalize pathway name for matching"""
-        return pathway.lower().strip()
+        """Normalize pathway name for matching: lower case, collapsed whitespace, and no
+        echoed id suffix ("Cell cycle (hsa04110)" -> "cell cycle")."""
+        # return pathway.lower().strip()  # kept ids and inner whitespace, so equal names missed
+        s = re.sub(r'\s*\((?:path:)?[a-z]{2,4}\d{5}\)\s*$', '', str(pathway or ''), flags=re.IGNORECASE)
+        return ' '.join(s.split()).lower()
 
     def _fuzzy_match_pathway(self, query: str) -> Optional[str]:
         """
@@ -88,19 +91,28 @@ class PathwayQueryService:
         """
         query_norm = self._normalize_pathway_name(query)
 
-        # Exact match
-        if query_norm in self.mechanism_index:
+        # Exact match, in either index. Before, the structure index was only searched
+        # after a partial match in the mechanism index, so "Ribosome" (structure only)
+        # could resolve to "ribosome biogenesis in eukaryotes".
+        if query_norm in self.mechanism_index or query_norm in self.structure_index:
             return query_norm
 
-        # Partial match - check if query is substring of any pathway
-        for pathway_name in self.mechanism_index.keys():
-            if query_norm in pathway_name or pathway_name in query_norm:
-                return pathway_name
-
-        # Check structure index as fallback
-        for pathway_name in self.structure_index.keys():
-            if query_norm in pathway_name or pathway_name in query_norm:
-                return pathway_name
+        # Partial match: the closest name in length wins (mechanism index first on a
+        # tie), not the first one listed. The first-listed rule let "Ribosome" and
+        # "Ribosome biogenesis in eukaryotes" return each other's mechanism.
+        candidates = []
+        for rank, index in enumerate((self.mechanism_index, self.structure_index)):
+            for pathway_name in index.keys():
+                if pathway_name and (query_norm in pathway_name or pathway_name in query_norm):
+                    candidates.append((abs(len(pathway_name) - len(query_norm)), rank, pathway_name))
+        if candidates:
+            return min(candidates)[2]
+        # for pathway_name in self.mechanism_index.keys():  # first listed, not closest
+        #     if query_norm in pathway_name or pathway_name in query_norm:
+        #         return pathway_name
+        # for pathway_name in self.structure_index.keys():
+        #     if query_norm in pathway_name or pathway_name in query_norm:
+        #         return pathway_name
 
         return None
 

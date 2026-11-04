@@ -200,6 +200,7 @@ def test_execute_enables_tools_when_structures_only():
     step.llm.chat_with_tools.return_value = {
         'content': _EMPTY_HYP_JSON, 'tool_calls': None, 'finish_reason': 'stop'
     }
+    step.llm.chat.return_value = _EMPTY_HYP_JSON
     mechanisms_result = {
         'pathway_mechanisms': [],
         'pathway_structures': _structures_only_step3()['pathway_structures'],
@@ -210,7 +211,12 @@ def test_execute_enables_tools_when_structures_only():
         mechanisms_result=mechanisms_result, analyses=None, context=None,
     )
     assert step.llm.chat_with_tools.called      # tool-calling path taken
-    assert not step.llm.chat.called
+    # Item 10: the model answered without querying the table pathway, so after one
+    # reminder the engine queried it and asked for the final answer with plain chat.
+    # That is the only chat call allowed besides the reviewers': no plain-chat fallback.
+    finals = [c for c in step.llm.chat.call_args_list
+              if 'All table pathways have now been queried' in str(c)]
+    assert finals, 'expected the engine-fill final call'
 
 
 def test_execute_disables_tools_when_step3_skipped():

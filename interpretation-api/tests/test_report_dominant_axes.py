@@ -16,6 +16,7 @@ def _bare_step06():
     return step
 
 
+SKIPPED = {'metadata': {'skipped': True}}
 
 INPUT_DATA = {'pathways': [
     {'name': 'Cell cycle', 'NES': 2.1},
@@ -50,7 +51,7 @@ def test_dominant_axes_labels_metric_honestly():
     section = step._generate_conclusions(
         study_context='x', input_data={'pathways': [{'name': 'P', 'ES': 0.5}]},
         step1=STEP1, step2={'master_regulators': []}, step3={},
-        step4={'hypotheses': []})
+        step4={'hypotheses': []}, step5=SKIPPED)
     assert '(ES +0.50)' in section.content
 
 
@@ -67,6 +68,7 @@ def test_key_findings_names_the_down_axis():
         ]},
         step3={'upstream_regulators': [{'tf': 'HNF4A'}]},
         step4={'hypotheses': [1, 2]},
+        step5=SKIPPED,
     )
     content = section.content
     assert 'Fatty acid degradation' in content          # down axis present
@@ -83,13 +85,13 @@ def test_key_findings_and_exec_summary_share_down_axis():
     conclusions = step._generate_conclusions(
         study_context='disease: HCC', input_data=INPUT_DATA, step1=STEP1,
         step2={'master_regulators': [{'gene': 'CDK1', 'direction': 'up'}]},
-        step3={}, step4={'hypotheses': [1]},
+        step3={}, step4={'hypotheses': [1]}, step5=SKIPPED,
     )
     exec_summary = step._generate_executive_summary(
         study_context='disease: HCC', input_data=INPUT_DATA, step1=STEP1,
         step2={'network_hubs': [{'gene': 'CDK1'}],
                'master_regulators': [{'gene': 'CDK1', 'direction': 'up'}]},
-        step3={}, step4={'hypotheses': [1]},
+        step3={}, step4={'hypotheses': [1]}, step5=SKIPPED,
     )
     down = 'Fatty acid degradation'
     assert down in conclusions.content
@@ -101,7 +103,7 @@ def test_key_findings_falls_back_without_enrichment_scores():
     section = step._generate_conclusions(
         study_context='x', input_data={'pathways': []}, step1=STEP1,
         step2={'master_regulators': [{'gene': 'CDK1', 'direction': 'up'}]},
-        step3={}, step4={'hypotheses': []},
+        step3={}, step4={'hypotheses': []}, step5=SKIPPED,
     )
     # No NES data -> fall back to the leading theme name, still producing findings.
     assert 'Biological Theme' in section.content

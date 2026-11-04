@@ -35,6 +35,15 @@ class Settings(BaseSettings):
     # e.g. OpenBio ~3.5 min). The old hardcoded 120s was shorter, so reviewer calls timed out.
     LLM_REQUEST_TIMEOUT: int = 600
 
+    # (PubMed / Semantic Scholar / PDF search settings removed — the 5-step
+    # interpretation service does not do literature verification.)
+
+    # Evidence Ranking Configuration
+    INITIAL_SEARCH_RESULTS: int = 100  # Initial search pool size (before quality filtering)
+    MAX_FILTERED_PAPERS: int = 20      # Max papers after journal quality filter (not used in hybrid mode)
+    MIN_SJR_THRESHOLD: float = 1.0     # Minimum SJR score for journal quality
+    TOP_K_CHUNKS: int = 15             # Number of top-ranked chunks to select for LLM verification
+
     # Pathway Clustering Configuration (Step 1 pathway-theme grouping)
     # Markov Clustering (van Dongen 2000) replaces the legacy connected-components
     # partitioning; it resolves the single-linkage chaining problem via flow simulation and
@@ -47,6 +56,19 @@ class Settings(BaseSettings):
     CLUSTER_GENE_SOURCE: str = "de"           # similarity gene set: "de" (current) | "full"
     CLUSTER_MIN_SIZE: int = 2                 # min pathways per cluster (aPEAR minClusterSize=2)
     CLUSTER_JACCARD_THRESHOLD: float = 0.25   # legacy connected_components edge cutoff (NOT aPEAR)
+
+    # LLM Prompt/Response Logging
+    # Records every LLM call — full request payload, raw unparsed completion, timing, usage,
+    # errors — under <root>/<studyId>/<analysisId>/<reportId>/. Ids ride in the pipeline
+    # input's free-form `metadata`; a run without them falls back to its job_id.
+    LLM_PROMPT_LOG_ENABLED: bool = True
+    # RELATIVE, and deliberately so: under the image's WORKDIR (/app) this resolves to
+    # /app/logs/llm_prompts — the exact path docker-compose.prod.yml mounts the host volume
+    # at. So even if the compose environment entry were dropped, the logs still land on the
+    # persisted volume instead of the container's writable layer (which a redeploy wipes).
+    LLM_PROMPT_LOG_DIR: str = "logs/llm_prompts"
+    # Delete logged runs older than this at service start. 0 = keep forever (NOT "keep none").
+    LLM_PROMPT_LOG_RETENTION_DAYS: int = 30
 
     # Pipeline Configuration
     PIPELINE_OUTPUT_DIR: str = "output/pipeline_jobs"  # Directory to save pipeline job outputs

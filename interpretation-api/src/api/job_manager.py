@@ -19,7 +19,7 @@ class JobStatus(str, Enum):
     FAILED = "failed"
 
 
-# Step definitions for the standard pipeline (5 steps)
+# Step definitions for standard pipeline (6 steps)
 PIPELINE_STEPS = [
     {
         "step": 1,
@@ -41,6 +41,7 @@ PIPELINE_STEPS = [
         "name": "Hypothesis Generation",
         "message": "Generating testable research hypotheses from pathway analysis..."
     },
+    # The old Step 5 (Therapeutic Implications) was removed; report generation is Step 5.
     {
         "step": 5,
         "name": "Report Generation",
@@ -48,17 +49,23 @@ PIPELINE_STEPS = [
     }
 ]
 
-# Additional steps that only run in the meta-analysis pipeline
+# Additional steps for meta-analysis pipeline, in execution order (matches server.py meta_steps_info)
 META_PIPELINE_STEPS = PIPELINE_STEPS + [
+    # Disabled: Reproducibility Analysis no longer runs, because its output no longer reaches the report.
+    # {
+    #     "step": 6,
+    #     "name": "Reproducibility Analysis",
+    #     "message": "Comparing findings across individual datasets for reproducibility..."
+    # },
     {
         "step": 6,
-        "name": "Reproducibility Analysis",
-        "message": "Comparing findings across individual datasets for reproducibility..."
+        "name": "Cross-Dataset Findings",
+        "message": "Summarising findings across individual datasets"
     },
     {
         "step": 7,
-        "name": "Comparative Report",
-        "message": "Generating comparative analysis report..."
+        "name": "Final Report",
+        "message": "Assembling the final report"
     }
 ]
 
@@ -92,9 +99,7 @@ class Job:
         if steps_info is not None:
             self.steps_info: List[Dict[str, Any]] = steps_info
         else:
-            self.steps_info: List[Dict[str, Any]] = (
-                META_PIPELINE_STEPS if total_steps == len(META_PIPELINE_STEPS) else PIPELINE_STEPS
-            )
+            self.steps_info: List[Dict[str, Any]] = META_PIPELINE_STEPS if total_steps == 8 else PIPELINE_STEPS
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert job to dictionary."""
@@ -131,7 +136,7 @@ class JobManager:
     def create_job(
         self,
         input_data: Dict[str, Any],
-        total_steps: int = 5,
+        total_steps: int = 6,
         steps_info: Optional[List[Dict[str, Any]]] = None
     ) -> str:
         """
@@ -139,8 +144,7 @@ class JobManager:
 
         Args:
             input_data: Input data for the pipeline
-            total_steps: Total number of steps in the pipeline (5 for the standard
-                pipeline, 7 for meta-analysis)
+            total_steps: Total number of steps in the pipeline (default 6, use 8 for meta-analysis)
             steps_info: Optional custom step definitions (overrides default based on total_steps)
 
         Returns:
@@ -228,8 +232,8 @@ class JobManager:
                 job = self.jobs[job_id]
                 job.current_step = step_number
                 # Use custom message or default from steps_info. Look up by the "step"
-                # field, not list position: a gene-free run omits steps 2 and 3, so the
-                # numbers present are 1,4,5 and position would not match.
+                # field, not list position — step numbering is non-contiguous now that
+                # Step 5 has been removed (steps are 1,2,3,4,6,...).
                 if message:
                     job.current_step_message = message
                 else:

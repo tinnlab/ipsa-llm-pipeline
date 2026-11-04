@@ -17,17 +17,26 @@ class PathwayCommonsService:
     def __init__(self):
         self.cache = {}
 
+    # Seconds. A 480-gene pathsbetween query (MitoPathways "Metabolism") took 31 s on
+    # 2026-11-01; 60 s left only 2x headroom once every pathway gene is queried (item 19).
+    TIMEOUT = 120
+
     def get_interactions_between(
         self,
         gene_symbols: List[str],
-        limit: int = 50
+        limit: Optional[int] = None
     ) -> List[PCInteraction]:
         """
         Get curated interactions between a set of genes using pathsbetween query.
 
         Args:
-            gene_symbols: List of gene symbols (e.g., ["NDUFS1", "UQCRC1"])
-            limit: Max genes to query (API can be slow with too many)
+            gene_symbols: Gene symbols. Pathway Commons' graph endpoint resolves only
+                upper-case (human) symbols; callers pass them upper-cased.
+            limit: Optional max genes to query. Default None: every pathway gene is
+                queried (main L236 "the interactions for all pathway genes"). The
+                former default of 50 is gone. Splitting the query into batches would
+                lose every interaction between genes in different batches, so it is
+                one call.
 
         Returns:
             List of PCInteraction (source, type, target)
@@ -35,8 +44,7 @@ class PathwayCommonsService:
         if not gene_symbols or len(gene_symbols) < 2:
             return []
 
-        # Limit genes to avoid overloading API
-        query_genes = gene_symbols[:limit]
+        query_genes = list(gene_symbols) if limit is None else list(gene_symbols)[:limit]
         cache_key = ",".join(sorted(query_genes))
         if cache_key in self.cache:
             return self.cache[cache_key]
@@ -48,7 +56,7 @@ class PathwayCommonsService:
                 "kind": "pathsbetween",
                 "format": "SIF"
             }
-            response = requests.get(url, params=params, timeout=60)
+            response = requests.get(url, params=params, timeout=self.TIMEOUT)
             if not response.ok or not response.text.strip():
                 return []
 
