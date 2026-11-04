@@ -45,7 +45,6 @@ def test_clean_at_boundaries_and_preserve(tmp_path, input_data, monkeypatch):
         "hypotheses": [{"hypothesis": "h1"}], "report_section": "r",
         "centralMechanisticModel": "", "metadata": {},
     }
-    orch.step5 = MagicMock(); orch.step5.execute.return_value = {"metadata": {"skipped": True}}
     orch.step6 = MagicMock(); orch.step6.execute.return_value = {"markdown_content": "# report"}
 
     results = orch.run_full_pipeline(input_data, job_id="testjob")
@@ -103,7 +102,6 @@ def test_step3_receives_organism_from_metadata(tmp_path, input_data, monkeypatch
         "hypotheses": [{"hypothesis": "h1"}], "report_section": "r",
         "centralMechanisticModel": "", "metadata": {},
     }
-    orch.step5 = MagicMock(); orch.step5.execute.return_value = {"metadata": {"skipped": True}}
     orch.step6 = MagicMock(); orch.step6.execute.return_value = {"markdown_content": "# report"}
 
     orch.run_full_pipeline(data, job_id="orgjob")

@@ -12,9 +12,11 @@ maps — those maps encode enzyme<->enzyme (``ECrel``) relations, not transcript
 A curated TF->target regulon database *is* built to know "HNF4A controls these metabolic
 genes", so testing regulon overlap recovers them.
 
-Ships a bundled CollecTRI human regulon (see ``data/collectri_human.tsv``; provenance in
-``data/README.md``). The loader is tolerant of a missing/malformed file — it degrades to
-``available == False`` so callers can fall back to an LLM-proposed candidate list.
+Uses a CollecTRI human regulon at ``data/collectri_human.tsv``. That file is NOT shipped
+with the repository — see ``data/README.md`` for how to fetch it. The loader is tolerant
+of a missing/malformed file: it degrades to ``available == False`` so callers fall back to
+an LLM-proposed candidate list, clearly labelled as hypotheses. Running without the file
+is a supported configuration, not an error path.
 
 No scipy dependency: the hypergeometric survival function is evaluated in log-space with
 ``math.lgamma`` (the deps are deliberately minimal — see requirements.txt).
