@@ -1,10 +1,15 @@
 """
-Full gene membership for non-KEGG pathways from bundled GMT files (item 19).
+Full gene membership for non-KEGG pathways, read from GMT files (item 19).
 
 Main L236: "For all other pathways (GO, Reactome, and custom pathways), it retrieves the
 interactions for all pathway genes from the Pathway Commons database." The website sends
 only a pathway's DE members (or nothing, on the meta path), so the engine looks the full
 membership up in the GMT files under ``interpretation-api/data/gmt/``.
+
+**No GMT file is shipped with this repository.** The gene-set collections are third-party
+data under their own redistribution terms, so that directory is empty here and this service
+simply finds nothing to match against; see ``interpretation-api/data/gmt/README.md``. Drop
+your own ``.gmt`` files in to enable the lookup.
 
 Matching is deliberately conservative, because GMT set names collide with common pathway
 names ("Translation", "Apoptosis", "TCA cycle", "ABC transporters"):
@@ -66,7 +71,11 @@ def file_organism(fname: str) -> Optional[str]:
 
 
 class PathwayMembershipService:
-    """Looks up full pathway membership in bundled GMT files."""
+    """Looks up full pathway membership in the GMT files under ``data/gmt``.
+
+    The directory is empty in this repository (see the module docstring), in which case
+    ``files`` stays empty and every pathway keeps the genes the website sent.
+    """
 
     def __init__(self, gmt_dir: Optional[Path] = None):
         self.files: Dict[str, Dict[str, List[str]]] = {}
@@ -78,6 +87,13 @@ class PathwayMembershipService:
                         _key(k): v for k, v in parse_gmt(path.read_text()).items()}
                 except OSError:
                     continue
+        # Say so rather than degrading silently: with no GMT loaded, membership lookups
+        # return nothing and the report's Methods section loses its pathway-database
+        # attribution, which is very hard to attribute to a missing data directory.
+        if not self.files:
+            print(f'  \u26a0\ufe0f  No .gmt files in {directory} \u2014 full pathway membership '
+                  f'lookup is disabled; pathways keep only the genes supplied by the caller. '
+                  f'See data/gmt/README.md.')
         self._source_file: Dict[str, str] = {}
 
     def associate_sources(self, pathways: Iterable[Dict],

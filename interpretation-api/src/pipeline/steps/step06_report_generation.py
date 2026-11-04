@@ -396,7 +396,14 @@ class Step06ReportGeneration:
         step4: Dict,
         step5: Dict
     ) -> ReportSection:
-        """Generate executive summary section"""
+        """Generate executive summary section.
+
+        The therapeutic/drug branches below are UNREACHABLE in this repository: the
+        former Step 5 is not part of the pipeline, `execute` pins step5_output to a
+        skipped marker, and the orchestrator never supplies one, so step5_skipped is
+        always True. The code is kept rather than deleted so the section can be revived
+        if a therapeutics step returns.
+        """
         # Check if steps were skipped
         step2_skipped = step2.get('metadata', {}).get('skipped', False)
         step5_skipped = step5.get('metadata', {}).get('skipped', False)

@@ -535,9 +535,9 @@ class PipelineOrchestrator:
                     except Exception as e:
                         logger.warning(f"Baseline comparison ({provider}) failed: {e}")
 
-            # Step 5 (Therapeutic Implications) has been removed from the pipeline.
-            # The implementation is retained in step05_therapeutic_implications.py but is
-            # intentionally not wired in; the pipeline goes straight from Step 4 to Step 5.
+            # The former Step 5 (Therapeutic Implications) has been removed from the
+            # pipeline and is not part of this repository; the pipeline goes straight from
+            # Step 4 to the report step below, which now occupies the step-5 slot.
 
             # Step 5: Final Report Generation (last step; previously numbered 6)
             step_start = time.time()
