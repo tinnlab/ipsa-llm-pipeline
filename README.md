@@ -452,9 +452,15 @@ them from disk instead — slower to wake, but no RAM held. Use level 2 if host 
 Both suites mock all LLM and network calls, so neither needs a GPU, a model, or network
 access.
 
+Use **Python 3.10-3.12**. `requirements.txt` pins `pydantic==2.5.0`, which has no wheel for
+Python 3.13 or newer: pip falls back to compiling `pydantic-core` from source and fails in
+cargo. The Docker image is built on `python:3.11-slim`, so the deployment path above is
+unaffected — this only bites when installing into a local interpreter that is too new.
+
 ```bash
 # Pipeline (interpretation-api)
 cd interpretation-api
+python3.11 -m venv .venv && source .venv/bin/activate   # 3.10-3.12
 pip install -r requirements.txt -r requirements-dev.txt
 python -m pytest tests/ -v
 
