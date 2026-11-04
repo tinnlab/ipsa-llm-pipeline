@@ -76,9 +76,20 @@ def test_empty_inputs_safe(allow_pathways, allow_genes):
         assert removed == []
 
 
-def test_predicate_is_case_sensitive_like_validator(allow_pathways, allow_genes):
-    # The validators use exact membership, so 'tp53' != 'TP53' and is treated as hallucinated.
-    step2 = {"hub_genes": [{"gene": "tp53"}]}
+def test_predicate_is_case_insensitive_like_validator(allow_pathways, allow_genes):
+    # Gene comparisons are case-insensitive on both sides (mouse-cased genes against
+    # upper-case lists and vice versa), in the strip and in the validator alike.
+    step2 = {"hub_genes": [{"gene": "tp53"}, {"gene": "Bogus1"}]}
     cleaned, removed = SV.strip_hallucinated_entities(step2, 2, allow_pathways, allow_genes)
-    assert removed == ["tp53"]
-    assert cleaned["hub_genes"] == []
+    assert removed == ["Bogus1"]
+    assert cleaned["hub_genes"] == [{"gene": "tp53"}]
+    result = SV.validate_step2_output(step2, {'genes': [{'geneSymbol': g} for g in allow_genes]})
+    errors = ' '.join(result.errors)
+    assert 'Bogus1' in errors and 'tp53' not in errors
+
+
+def test_mouse_cased_card_gene_kept_against_upper_case_allow_set(allow_pathways):
+    step3 = {"pathway_mechanisms": [{"deGeneInvolvement": [{"gene": "Ndufs1"}, {"gene": "Xyz9"}]}]}
+    cleaned, removed = SV.strip_hallucinated_entities(step3, 3, allow_pathways, {"NDUFS1"})
+    assert removed == ["Xyz9"]
+    assert cleaned["pathway_mechanisms"][0]["deGeneInvolvement"] == [{"gene": "Ndufs1"}]

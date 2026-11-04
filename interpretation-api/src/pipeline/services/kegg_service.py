@@ -64,6 +64,80 @@ class PathwayEntry:
     link: Optional[str] = None
     reaction: Optional[str] = None
     components: List[str] = field(default_factory=list)  # member entry ids for 'group' entries
+    # Primary symbol of EVERY gene in the box, from the KEGG id -> symbol mapping. A KGML
+    # box often holds several genes (e.g. MCM2..MCM7), but its graphics name lists only
+    # the first gene's symbol and that gene's aliases ("MCM2, BM28, CCNL1, ..."), so the
+    # graphics name alone cannot tell which genes the box holds (item 17).
+    gene_symbols: List[str] = field(default_factory=list)
+
+
+def entry_symbols(entry: PathwayEntry) -> List[str]:
+    """All valid gene symbols of a gene entry: gene_symbols, else the graphics symbol."""
+    syms = [s for s in (entry.gene_symbols or []) if _is_gene_symbol(s)]
+    if syms:
+        return syms
+    sym = _clean_symbol(entry.gene_symbol)
+    return [sym] if _is_gene_symbol(sym) else []
+
+
+# Organism code -> {KEGG gene id (no prefix) -> primary symbol}. Shared by every
+# KEGGService instance in the process; one `list/<org>` call per organism.
+_SYMBOL_MAP_CACHE: Dict[str, Dict[str, str]] = {}
+
+
+def parse_kegg_gene_list(text: str) -> Dict[str, str]:
+    """Parse KEGG `list/<org>` (or `list/<id>+<id>`) output into {id: primary symbol}.
+
+    Lines look like "hsa:4171<TAB>CDS<TAB>3:...<TAB>MCM2, BM28, ...; description" or
+    "hsa:4171<TAB>MCM2, BM28, ...; description". The primary symbol is the first token
+    before the first comma of the part before ';'. Lines without ';' carry no symbol.
+    """
+    out: Dict[str, str] = {}
+    for line in text.splitlines():
+        parts = line.split('\t')
+        if len(parts) < 2:
+            continue
+        gid = parts[0].split(':', 1)[-1].strip()
+        desc = parts[-1]
+        if ';' not in desc:
+            continue
+        sym = _clean_symbol(desc.split(';', 1)[0].split(',', 1)[0])
+        if gid and _is_gene_symbol(sym):
+            out[gid] = sym
+    return out
+
+
+def _pathway_title_key(name: str) -> str:
+    """Comparable pathway title: drops a trailing organism ("- Homo sapiens (human)") and
+    an echoed id ("(hsa03010)"), lower-cases and collapses whitespace."""
+    s = str(name or '')
+    s = re.sub(r'\s+-\s+[^-]*\([^()]*\)\s*$', '', s)
+    s = re.sub(r'\s*\((?:path:)?[a-z]{2,4}\d{5}\)\s*$', '', s, flags=re.IGNORECASE)
+    return ' '.join(s.split()).lower()
+
+
+def _choose_kegg_hit(lines: List[str], pathway_name: str, org_code: str) -> Optional[str]:
+    """Pick the KEGG find/pathway hit for `pathway_name`.
+
+    1. A hit whose title equals the requested name (organism-specific id preferred).
+    2. Otherwise the previous rule: the first organism-specific hit, else the first hit.
+    """
+    wanted = _pathway_title_key(pathway_name)
+    hits = []
+    for line in lines:
+        parts = line.split('\t')
+        if len(parts) < 2:
+            continue
+        pid = parts[0].split(':', 1)[-1].strip()  # strip any db prefix (e.g. 'path:')
+        hits.append((pid, _pathway_title_key(parts[1])))
+    exact = [pid for pid, title in hits if title == wanted]
+    for pool in (exact, [pid for pid, _ in hits]):
+        for pid in pool:
+            if pid.startswith(org_code):
+                return pid
+        if pool:
+            return pool[0]
+    return None
 
 
 @dataclass
@@ -215,20 +289,22 @@ class KEGGService:
             # take the first reference hit, then normalize to the organism-specific
             # form (e.g. hsa00650) — KGML only exists for that form, not the generic
             # reference map (get/map00650/kgml -> HTTP 404).
-            chosen = None
-            for line in lines:
-                parts = line.split('\t')
-                if len(parts) < 2:
-                    continue
-
-                pid = parts[0].split(':', 1)[-1]  # strip any db prefix (e.g. 'path:')
-
-                # Prefer organism-specific pathway
-                if pid.startswith(org_code):
-                    chosen = pid
-                    break
-                if chosen is None:
-                    chosen = pid
+            # find/pathway matches substrings, so "Ribosome" also returns "Ribosome
+            # biogenesis in eukaryotes" (listed first). Taking the first hit sent the
+            # Ribosome card to hsa03008, giving two cards the same map. A hit whose name
+            # equals the requested name wins; otherwise the old first-hit rule applies.
+            chosen = _choose_kegg_hit(lines, pathway_name, org_code)
+            # chosen = None
+            # for line in lines:  # first hit, ignoring the name: picked the wrong map
+            #     parts = line.split('\t')
+            #     if len(parts) < 2:
+            #         continue
+            #     pid = parts[0].split(':', 1)[-1]
+            #     if pid.startswith(org_code):
+            #         chosen = pid
+            #         break
+            #     if chosen is None:
+            #         chosen = pid
 
             if chosen is None:
                 return None
@@ -289,6 +365,30 @@ class KEGGService:
             print(f'  Error fetching KGML: {e}')
             return None
 
+    def _gene_symbol_map(self, org_code: str) -> Dict[str, str]:
+        """{KEGG gene id -> primary symbol} for an organism, fetched once and cached.
+
+        Returns {} on failure; entries then fall back to the graphics-name symbol.
+        """
+        if not org_code:
+            return {}
+        if org_code in _SYMBOL_MAP_CACHE:
+            return _SYMBOL_MAP_CACHE[org_code]
+        failed_key = f'symbol_map_failed_{org_code}'
+        if getattr(self, 'cache', {}).get(failed_key):
+            return {}  # failed earlier in this run: don't wait another 60 s per pathway
+        try:
+            response = requests.get(f'{self.base_url}/list/{org_code}', timeout=60)
+            mapping = parse_kegg_gene_list(response.text) if response.ok else {}
+        except Exception as e:
+            print(f'  Could not fetch KEGG gene list for {org_code}: {e}')
+            mapping = {}
+        if mapping:
+            _SYMBOL_MAP_CACHE[org_code] = mapping
+        elif isinstance(getattr(self, 'cache', None), dict):
+            self.cache[failed_key] = True
+        return mapping
+
     def _parse_kgml(self, kgml: str, pathway_id: str) -> Optional[PathwayStructure]:
         """Parse KGML XML to extract pathway structure"""
         try:
@@ -300,7 +400,8 @@ class KEGGService:
             if not isinstance(entry_list, list):
                 entry_list = [entry_list]
 
-            entries = self._extract_entries(entry_list)
+            symbol_map = self._gene_symbol_map(pathway.get('@org', ''))
+            entries = self._extract_entries(entry_list, symbol_map)
 
             # Extract relations (interactions between entries)
             relation_list = pathway.get('relation', [])
@@ -337,8 +438,14 @@ class KEGGService:
             print(f'  Error parsing KGML: {e}')
             return None
 
-    def _extract_entries(self, entry_array: List[Dict]) -> List[PathwayEntry]:
-        """Extract entries (genes, compounds, groups) from KGML"""
+    def _extract_entries(self, entry_array: List[Dict],
+                         symbol_map: Optional[Dict[str, str]] = None) -> List[PathwayEntry]:
+        """Extract entries (genes, compounds, groups) from KGML.
+
+        `symbol_map` ({KEGG gene id -> primary symbol}) gives every gene in a multi-gene
+        box its own symbol (gene_symbols). Without it, only the graphics symbol is known.
+        """
+        symbol_map = symbol_map or {}
         entries = []
 
         for entry in entry_array:
@@ -364,6 +471,13 @@ class KEGGService:
                     comp = [comp] if comp else []
                 components = [c['@id'] for c in comp if isinstance(c, dict) and '@id' in c]
 
+            gene_symbols = []
+            if entry.get('@type') == 'gene':
+                for gid in gene_names:
+                    sym = symbol_map.get(gid)
+                    if sym and sym not in gene_symbols:
+                        gene_symbols.append(sym)
+
             entries.append(PathwayEntry(
                 id=entry['@id'],
                 type=entry['@type'],
@@ -372,7 +486,8 @@ class KEGGService:
                 gene_symbol=self._extract_gene_symbol(graphics_name),
                 link=entry.get('@link'),
                 reaction=entry.get('@reaction'),
-                components=components
+                components=components,
+                gene_symbols=gene_symbols,
             ))
 
         return entries
@@ -394,18 +509,18 @@ class KEGGService:
         seen = set()
 
         def resolve_genes(entry: PathwayEntry) -> List[str]:
-            """Resolve an entry to a list of valid gene symbols (expanding groups)."""
+            """Resolve an entry to its valid gene symbols: every gene of a multi-gene box
+            (item 17), and every gene of every member of a group."""
             if entry.type == 'gene':
-                sym = _clean_symbol(entry.gene_symbol)
-                return [sym] if _is_gene_symbol(sym) else []
+                return entry_symbols(entry)
             if entry.type == 'group':
                 genes = []
                 for comp_id in entry.components:
                     member = entry_map.get(comp_id)
                     if member and member.type == 'gene':
-                        sym = _clean_symbol(member.gene_symbol)
-                        if _is_gene_symbol(sym):
-                            genes.append(sym)
+                        for sym in entry_symbols(member):
+                            if sym not in genes:
+                                genes.append(sym)
                 return genes
             return []  # compound / map endpoints are not genes
 
@@ -547,20 +662,20 @@ class KEGGService:
         mapped_genes = []
         seen_symbols = set()
 
+        # Every gene of every box is considered (item 17): a DE gene listed second in a
+        # multi-gene box used to be invisible because only the box's first symbol was read.
         for pathway_gene in pathway_structure.genes:
-            if not pathway_gene.gene_symbol:
-                continue
-
-            symbol = pathway_gene.gene_symbol.upper()
-
-            if symbol in de_gene_map and symbol not in seen_symbols:
+            for gene_symbol in entry_symbols(pathway_gene):
+                symbol = gene_symbol.upper()
+                if symbol not in de_gene_map or symbol in seen_symbols:
+                    continue
                 seen_symbols.add(symbol)
                 de_gene = de_gene_map[symbol]
                 fold_change = de_gene.get('foldChange', 0)
 
                 mapped_genes.append(MappedDEGene(
                     pathway_entry_id=pathway_gene.id,
-                    gene_symbol=pathway_gene.gene_symbol,
+                    gene_symbol=gene_symbol,
                     kegg_names=pathway_gene.names,
                     fold_change=fold_change,
                     p_value=de_gene.get('pValue', 1.0),
@@ -588,9 +703,14 @@ class KEGGService:
         if not pathway_structure or not mapped_de_genes:
             return []
 
-        de_gene_ids = {g.pathway_entry_id for g in mapped_de_genes}
+        # Keep every relation with a DE gene at one end (main L236), matched on the
+        # gene symbols _extract_relations already resolved (groups and multi-gene boxes
+        # expanded). Matching on entry ids lost relations on a DE gene's other boxes and
+        # on groups, whose entry id is the group's, not the gene's (item 17).
+        de_symbols = {g.gene_symbol.upper() for g in mapped_de_genes if g.gene_symbol}
 
+        # de_gene_ids = {g.pathway_entry_id for g in mapped_de_genes}  # replaced: id match lost relations (item 17)
         return [
             rel for rel in pathway_structure.relations
-            if rel.entry1 in de_gene_ids or rel.entry2 in de_gene_ids
+            if (rel.source or '').upper() in de_symbols or (rel.target or '').upper() in de_symbols
         ]

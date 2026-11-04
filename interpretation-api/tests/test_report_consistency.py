@@ -15,6 +15,7 @@ def _bare_step06():
     return step
 
 
+SKIPPED5 = {'metadata': {'skipped': True}}
 
 
 def test_methodology_appendix_has_no_therapeutic_step():
@@ -23,6 +24,7 @@ def test_methodology_appendix_has_no_therapeutic_step():
     section = step._generate_appendices(
         input_data={'metadata': {'organism': 'Homo sapiens'}},
         step1={'themes': []}, step2={'network_hubs': []}, step3={}, step4={},
+        step5=SKIPPED5,
     )
     text = section.content
     assert 'Therapeutic' not in text
@@ -42,6 +44,7 @@ def test_executive_summary_master_regulator_count_consistent():
         step1={'themes': [{'name': 'Cell cycle control'}]},
         step2={'network_hubs': hubs, 'master_regulators': masters},
         step3={}, step4={'hypotheses': [1, 2, 3, 4]},
+        step5=SKIPPED5,
     )
     content = section.content
     # All 5 master regulators listed, count says "5 of 20" (not the old "3 of 20")
@@ -52,11 +55,11 @@ def test_executive_summary_master_regulator_count_consistent():
     assert 'Druggable targets' not in content
 
 
-def test_execute_takes_no_step5_output():
-    """The removed Therapeutics step must leave no vestigial parameter on execute."""
+def test_execute_accepts_missing_step5_output():
+    """step5_output is optional; execute must not require it."""
     import inspect
     sig = inspect.signature(Step06ReportGeneration.execute)
-    assert 'step5_output' not in sig.parameters
+    assert sig.parameters['step5_output'].default is None
 
 
 def test_pipeline_steps_contiguous_and_report_is_step5():

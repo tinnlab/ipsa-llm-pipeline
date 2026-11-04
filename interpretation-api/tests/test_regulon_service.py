@@ -3,8 +3,7 @@ Tests for the TF->target regulon enrichment service (report bug 7).
 
 Covers the pure statistics (hypergeometric survival, BH-FDR), sign-aware activity
 inference, overlap/FDR gating that drops off-program TFs, ranking, and graceful
-degradation when the regulon file is missing — which is the default, since the
-CollecTRI network is fetched by the user rather than shipped with the repo.
+degradation when the bundled regulon file is missing.
 """
 
 from math import comb
@@ -13,10 +12,10 @@ import pytest
 
 from src.pipeline.services.regulon_service import (
     RegulonService,
-    _DEFAULT_PATH,
     hypergeom_sf,
     bh_fdr,
     _activity_from_net,
+    _DEFAULT_PATH,
 )
 
 

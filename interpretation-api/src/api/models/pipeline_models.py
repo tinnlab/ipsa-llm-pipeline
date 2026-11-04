@@ -93,7 +93,7 @@ class StepRequest(BaseModel):
     input_data: PipelineInput = Field(..., description="Pipeline input data")
     previous_results: Optional[Dict[str, Any]] = Field(
         None,
-        description="Results from previous steps (required for steps 2-5)"
+        description="Results from previous steps (required for steps 2-6)"
     )
 
 
@@ -118,7 +118,7 @@ class JobStatusResponse(BaseModel):
     # Step progress tracking
     current_step: Optional[int] = Field(None, description="Currently executing step number (1-based)")
     current_step_message: Optional[str] = Field(None, description="Current step progress message (dynamic based on context)")
-    total_steps: int = Field(default=5, description="Total number of steps in the pipeline")
+    total_steps: int = Field(default=6, description="Total number of steps in the pipeline")
     steps_info: List[Dict[str, Any]] = Field(default_factory=list, description="Step definitions with name and message for each step")
     step_results: Dict[str, Any] = Field(default_factory=dict, description="Results for each completed step")
     step_execution_times: Dict[str, float] = Field(default_factory=dict, description="Execution time for each completed step in seconds")

@@ -64,8 +64,29 @@ services:
       - REVIEWER_LLM_MODEL=aaditya/Llama3-OpenBioLLM-70B
       - API_HOST=0.0.0.0
       - API_PORT=6000
+      # LLM prompt/response log. Every call to the main model and the reviewer is recorded
+      # with its request payload, raw completion, timing, token usage and any error, under
+      #   <dir>/<studyId>/<analysisId>/<reportId>/llm_calls.jsonl
+      # The ids ride in the pipeline input's free-form `metadata`; a caller that sends none
+      # gets a bucket keyed by job_id instead.
+      #
+      # LLM_PROMPT_LOG_DIR is the CONTAINER-side path and is hardcoded on purpose: it must
+      # stay in lockstep with the volume mount below. Point it elsewhere and logging keeps
+      # working with no error while writing into the container's writable layer, which every
+      # `docker compose up -d` wipes. Do not turn it into a ${...} parameter.
+      - LLM_PROMPT_LOG_DIR=/app/logs/llm_prompts
+      # Escape hatch. The `:-` form also covers an EMPTY value, which matters because
+      # pydantic cannot parse "" as a bool and would fail service start.
+      - LLM_PROMPT_LOG_ENABLED=${LLM_PROMPT_LOG_ENABLED:-true}
+      # Delete logged runs older than this at service start. 0 = keep forever (not "keep none").
+      - LLM_PROMPT_LOG_RETENTION_DAYS=${LLM_PROMPT_LOG_RETENTION_DAYS:-30}
     ports:
       - "${PIPELINE_PORT:-6000}:6000"
+    volumes:
+      # The only persisted path this service has. Without it the prompt logs live in the
+      # container's writable layer and vanish on the next deploy. Set LLM_PROMPT_LOG_HOST_DIR
+      # in .env to a real path on persistent storage and create it before the first deploy.
+      - ${LLM_PROMPT_LOG_HOST_DIR:-./data/prompt-logs}:/app/logs/llm_prompts
     depends_on:
       - llm-router
     restart: unless-stopped

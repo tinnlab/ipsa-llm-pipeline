@@ -5,6 +5,8 @@ from .step02_hub_genes import Step02HubGenes
 from .step03_pathway_mechanisms import Step03PathwayMechanisms
 from .step04_hypothesis_generation import Step04HypothesisGeneration
 from .step06_report_generation import Step06ReportGeneration
+# Step 5 (Therapeutic Implications) removed from the pipeline; module retained on disk
+# but no longer exported.
 
 __all__ = [
     'Step01PathwayThemes',

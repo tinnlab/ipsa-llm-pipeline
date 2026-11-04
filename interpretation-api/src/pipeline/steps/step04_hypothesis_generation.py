@@ -18,6 +18,7 @@ import json
 import math
 import time
 import threading
+import contextvars
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass, asdict
@@ -35,9 +36,71 @@ from src.pipeline.fc_utils import (
 # hypothesis seeding ranks pathways on the same effect-size scale the report uses.
 from src.pipeline.steps.step03_pathway_mechanisms import _enrichment_metric, _magnitude_label
 
+from src.pipeline.hypothesis_checks import (
+    hypothesis_direction_errors, loose_direction_matches, strict_direction_errors,
+    correct_arrow_fc, relation_reference, relation_claim_errors,
+    differs_at_printed_precision, correct_pathway_stats,
+)
+from src.pipeline.fc_utils import gene_fold_change
+
 # |NES| at/above which an enrichment direction is considered "dominant" and MUST
 # be represented by a hypothesis (mirrors the 'strong' cutoff in _magnitude_label).
 DOMINANT_NES_THRESHOLD = 2.0
+
+# Items 12 and 13 (main L252): a hypothesis with a direction error, or listing a
+# relation the tool calls did not return, is rewritten once and removed if the rewrite
+# still has the error. Off until the owner switches it on after reading the measured
+# flags; the checks run and are recorded in the Step 4 metadata either way.
+STEP4_REWRITE_ENABLED = False
+
+
+class _GeneStatMatch:
+    """Stand-in for a regex match with groups (gene, text between, value), so the gene
+    p-value/FDR replacers work with the nearest-gene binding (item 25)."""
+
+    def __init__(self, gene: str, prefix: str, value: str):
+        self._groups = (gene + prefix + value, gene, prefix, value)
+
+    def group(self, i: int = 0) -> str:
+        return self._groups[i]
+
+
+def _apply_to_printed_fields(result: Dict, fn) -> None:
+    """Apply a text-correcting function to every printed text field of the hypotheses,
+    the central model, the summary and the key predictions, in place."""
+    def fix(value):
+        return fn(value) if isinstance(value, str) and value else value
+    for hyp in result.get('hypotheses', []) or []:
+        if not isinstance(hyp, dict):
+            continue
+        for field in ('hypothesis', 'mechanisticModel', 'confidenceRationale',
+                      'directionalPrediction', 'quantitativePrediction'):
+            if field in hyp:
+                hyp[field] = fix(hyp[field])
+        for list_field in ('keyPlayers', 'evidenceSupporting'):
+            if isinstance(hyp.get(list_field), list):
+                hyp[list_field] = [fix(x) for x in hyp[list_field]]
+        if isinstance(hyp.get('testability'), dict):
+            for k in list(hyp['testability']):
+                hyp['testability'][k] = fix(hyp['testability'][k])
+    for key in ('centralMechanisticModel', 'hypothesesSummary'):
+        if key in result:
+            result[key] = fix(result.get(key))
+    for pred in result.get('keyPredictions', []) or []:
+        if isinstance(pred, dict):
+            for k in list(pred):
+                pred[k] = fix(pred[k])
+
+
+def _gene_fc_cased(genes: List[Dict]) -> Dict[str, float]:
+    """{gene symbol as written -> signed fold change} (case kept, 0.0-safe)."""
+    out: Dict[str, float] = {}
+    for g in genes or []:
+        sym = (g.get('geneSymbol') or g.get('gene_symbol') or g.get('gene') or g.get('name') or '').strip()
+        fc = gene_fold_change(g)
+        if sym and fc is not None:
+            out[sym] = fc
+    return out
 
 
 def _nes_axis_signals(pathways: List[Dict]):
@@ -175,7 +238,11 @@ class Step04HypothesisGeneration:
                 pass  # warm-up is best-effort
 
         try:
-            t = threading.Thread(target=_warm, daemon=True)
+            # A new thread starts with an EMPTY contextvars context, so without this copy the
+            # warm-up's LLM call would lose the prompt-log context and land in the
+            # unattributed bucket instead of this run's directory.
+            ctx = contextvars.copy_context()
+            t = threading.Thread(target=lambda: ctx.run(_warm), daemon=True)
             t.start()
             return t
         except Exception:
@@ -296,10 +363,21 @@ class Step04HypothesisGeneration:
                 {'role': 'user', 'content': user_prompt}
             ]
 
-            max_iterations = 20
+            # Main L248: the model must query the pathways through tool calls. Every table
+            # pathway is asked for, so more rounds are needed than the former 20 (item 10).
+            max_iterations = 30
             tool_calls_made = 0
             collected_kegg_relations = []  # Collect all KEGG relations from tool calls
             max_retries = 3  # Retry on intermittent vLLM errors
+            table_pathways = list(getattr(self, '_table_pathways', []) or [])
+            tool_log = {'calls': [], 'rounds': 0, 'table_pathways': table_pathways,
+                        'queried_by_model': [], 'filled_by_engine': [], 'nudged': False,
+                        'max_iter_fallback': False}
+            queried = set()  # normalized names (case, spacing, echoed id), not raw strings
+
+            def _cov_key(name):
+                return (pathway_service._normalize_pathway_name(name or '') if pathway_service
+                        else ' '.join(str(name or '').split()).lower())
 
             for iteration in range(max_iterations):
                 # Make LLM call (with or without tools)
@@ -396,6 +474,14 @@ class Step04HypothesisGeneration:
 
                         # Execute tool via pathway service
                         tool_result = pathway_service.execute_tool(tool_name, tool_args)
+                        resolved = (tool_result.get('pathway') if isinstance(tool_result, dict)
+                                    and not tool_result.get('error') else None)
+                        tool_log['calls'].append({'round': iteration + 1, 'tool': tool_name,
+                                                  'args': tool_args, 'resolved_pathway': resolved,
+                                                  'by': 'model'})
+                        if tool_name == 'get_pathway_mechanism' and resolved and _cov_key(resolved) not in queried:
+                            queried.add(_cov_key(resolved))
+                            tool_log['queried_by_model'].append(resolved)
 
                         # Collect KEGG relations from pathway mechanism results
                         if tool_name == 'get_pathway_mechanism' and isinstance(tool_result, dict):
@@ -424,13 +510,68 @@ class Step04HypothesisGeneration:
                         })
 
                 else:
-                    # LLM finished - parse final response
+                    # LLM finished. Item 10: every table pathway must have been queried.
+                    missing = ([p for p in table_pathways if _cov_key(p) not in queried]
+                               if pathway_service else [])
+                    if missing and not tool_log['nudged']:
+                        # One reminder naming the pathways not yet queried, then continue.
+                        tool_log['nudged'] = True
+                        print(f'  Coverage: {len(missing)} table pathway(s) not queried — asking once')
+                        messages.append({'role': 'assistant', 'content': llm_response.get('content') or ''})
+                        messages.append({'role': 'user', 'content': (
+                            'Before giving the final answer, call get_pathway_mechanism() for each '
+                            'of these pathways from the table, which you have not queried yet: '
+                            + '; '.join(missing)
+                            + '. Then return the final JSON, basing each hypothesis on the '
+                              'relations the tool calls returned.')})
+                        continue
+                    if missing:
+                        # Still missing after the reminder: the engine queries them and asks
+                        # for the final answer with those results in the conversation.
+                        print(f'  Coverage: engine querying {len(missing)} remaining table pathway(s)')
+                        fill_calls = [{'id': f'engine_fill_{k}', 'type': 'function',
+                                       'function': {'name': 'get_pathway_mechanism',
+                                                    'arguments': json.dumps({'pathway_name': p})}}
+                                      for k, p in enumerate(missing)]
+                        messages.append({'role': 'assistant', 'content': None, 'tool_calls': fill_calls})
+                        for call, p in zip(fill_calls, missing):
+                            tool_result = pathway_service.execute_tool(
+                                'get_pathway_mechanism', {'pathway_name': p})
+                            resolved = (tool_result.get('pathway') if isinstance(tool_result, dict)
+                                        and not tool_result.get('error') else None)
+                            tool_log['calls'].append({'round': iteration + 1, 'tool': 'get_pathway_mechanism',
+                                                      'args': {'pathway_name': p},
+                                                      'resolved_pathway': resolved, 'by': 'engine'})
+                            tool_log['filled_by_engine'].append(p)
+                            if resolved:
+                                queried.add(_cov_key(resolved))
+                            if isinstance(tool_result, dict):
+                                for rel in tool_result.get('curatedRelations', []) or []:
+                                    collected_kegg_relations.append({
+                                        'source': rel.get('source', '').upper(),
+                                        'target': rel.get('target', '').upper(),
+                                        'type': rel.get('type', ''),
+                                        'pathway': p})
+                            messages.append({'role': 'tool', 'tool_call_id': call['id'],
+                                             'name': 'get_pathway_mechanism',
+                                             'content': json.dumps(tool_result)})
+                        messages.append({'role': 'user', 'content': (
+                            'All table pathways have now been queried. Return the final JSON with '
+                            'your hypotheses, basing each on the relations the tool calls returned.')})
+                        final = self.llm.chat(messages=messages, temperature=0.0, seed=seed,
+                                              max_tokens=8000)
+                        response = final.get('content', '') if isinstance(final, dict) else final
+                        tool_log['rounds'] = iteration + 1
+                        break
                     print(f'  Tool calling complete: {tool_calls_made} total calls made')
                     response = llm_response['content']
+                    tool_log['rounds'] = iteration + 1
                     break
 
             else:
                 # Max iterations reached
+                tool_log['max_iter_fallback'] = True
+                tool_log['rounds'] = max_iterations
                 print(f'  Warning: Max iterations ({max_iterations}) reached')
                 print(f'  Making final call to LLM to generate hypotheses with current context...')
 
@@ -457,6 +598,14 @@ class Step04HypothesisGeneration:
                 if response is None or response.strip() == '':
                     print(f'  ⚠️  No response from LLM after max iterations - returning empty hypotheses')
                     response = '{"hypotheses": [], "centralMechanisticModel": "Unable to generate hypotheses due to iteration limit.", "keyPredictions": [], "hypothesesSummary": "Hypothesis generation incomplete."}'
+
+            # The conversation with every tool call and result, so the regeneration
+            # paths see the relations the tool calls returned (item 10).
+            tool_context = list(messages)
+            self._tool_context = tool_context
+            self._collected_relations = collected_kegg_relations
+            tool_log['calls_total'] = len(tool_log['calls'])
+            tool_log['missing_after_loop'] = [p for p in table_pathways if _cov_key(p) not in queried]
 
             # Clean up response before parsing
             if response is None:
@@ -514,7 +663,44 @@ class Step04HypothesisGeneration:
 
             print(f'\n  Hypotheses Generated: {len(result.get("hypotheses", []))}')
 
-            # NEW: Validate hypotheses for gene regulation direction errors
+            # Items 12/13 (main L252): direction and relation checks right after generation,
+            # before the biology review. Flags are always recorded; with
+            # STEP4_REWRITE_ENABLED a flagged hypothesis is rewritten once, and removed if
+            # the rewrite still has the error. A removal counts toward the "< 4" test and
+            # starts the summary rewrite below, like a biochemistry removal.
+            self._seed = seed
+            self._rewrite_log = []
+            hypothesis_flags = []
+            rewrite_removed = 0
+            rewrite_removed_reasons = []
+            kept_hyps = []
+            for i, hyp in enumerate(result.get('hypotheses', []) or [], 1):
+                if not isinstance(hyp, dict):
+                    kept_hyps.append(hyp)
+                    continue
+                direction, relations = self._hypothesis_problems(hyp, genes)
+                if direction or relations:
+                    hypothesis_flags.append({'hypothesis': i, 'direction_errors': direction,
+                                             'relation_errors': relations})
+                if STEP4_REWRITE_ENABLED and (direction or relations):
+                    fixed = self._rewrite_or_remove(hyp, genes, seed_offset=400 + i,
+                                                    log=self._rewrite_log, label=f'Hypothesis {i}')
+                    if fixed is None:
+                        rewrite_removed += 1
+                        rewrite_removed_reasons.append(
+                            f"- Hypothesis {i} was REMOVED: still had "
+                            + ', '.join([f"{e['gene']} described as {e['claimed']}-regulated" for e in direction]
+                                        + [f"unreturned relation {e['source']} -> {e['target']}" for e in relations]))
+                        continue
+                    hyp = fixed
+                kept_hyps.append(hyp)
+            if STEP4_REWRITE_ENABLED:
+                result['hypotheses'] = kept_hyps
+            if hypothesis_flags:
+                print(f'  Direction/relation flags on {len(hypothesis_flags)} hypothesis(es); '
+                      f'rewrite {"on" if STEP4_REWRITE_ENABLED else "off"}; removed {rewrite_removed}')
+
+            # Biology review (and a re-check of directions on the surviving hypotheses)
             validation_errors = self._validate_hypothesis_directions(result, genes, experiment_context)
             # Filter out hypotheses with error-severity biochemistry issues
             biochem_errors = [e for e in validation_errors if 'Biochemistry' in e]
@@ -538,15 +724,17 @@ class Step04HypothesisGeneration:
                 if match:
                     error_indices.add(int(match.group(1)))
 
-            # Filter out hypotheses at those indices (1-based -> 0-based)
-            if error_indices and result.get('hypotheses'):
-                original_count = len(result['hypotheses'])
+            # Filter out hypotheses at those indices (1-based -> 0-based). A removal by the
+            # item 12/13 rewrite step counts here too (main L254).
+            if (error_indices or rewrite_removed) and result.get('hypotheses') is not None:
+                original_count = len(result['hypotheses']) + rewrite_removed
                 result['hypotheses'] = [
                     hyp for i, hyp in enumerate(result['hypotheses'], 1)
                     if i not in error_indices
                 ]
                 removed = original_count - len(result['hypotheses'])
-                print(f'\n  🔬 Filtered out {removed} hypothesis(es) with biochemistry errors (indices: {sorted(error_indices)})')
+                print(f'\n  🔬 Filtered out {removed} hypothesis(es) (biochemistry indices: {sorted(error_indices)}, '
+                      f'rewrite removals: {rewrite_removed})')
                 print(f'  Hypotheses remaining: {len(result["hypotheses"])}')
 
                 # --- Regeneration: retry loop to replace removed hypotheses ---
@@ -554,7 +742,7 @@ class Step04HypothesisGeneration:
                     print(f'\n  🔄 {removed} hypothesis(es) removed, {len(result["hypotheses"])} remaining (< 4) — regenerating with biochemistry feedback...')
 
                     # Build feedback message with specific errors for removed hypotheses
-                    feedback_lines = []
+                    feedback_lines = list(rewrite_removed_reasons)
                     for err in biochem_errors:
                         match = re.match(r'Biochemistry review \(error\) - Hypothesis (\d+): (.*)', err)
                         if match and int(match.group(1)) in error_indices:
@@ -609,10 +797,10 @@ class Step04HypothesisGeneration:
                             f"containing the {needed} new hypotheses."
                         )
 
-                        # Build minimal context for regeneration (skip tool call history to avoid oversized prompt)
-                        regen_messages = [
-                            messages[0],   # system prompt
-                            messages[1],   # user prompt (contains all data)
+                        # Regeneration context keeps the tool calls and their results, so
+                        # regenerated hypotheses see the relations the tool calls returned
+                        # (main L248, item 10). It used to drop them to keep the prompt small.
+                        regen_messages = tool_context + [
                             {'role': 'assistant', 'content': response},  # original hypothesis response
                             {'role': 'user', 'content': regen_prompt}
                         ]
@@ -672,6 +860,26 @@ class Step04HypothesisGeneration:
                                     if i not in regen_error_indices
                                 ]
 
+                                # Item 12: regenerated hypotheses get the same direction /
+                                # relation step (flags recorded; rewrite-or-remove when on).
+                                checked_new = []
+                                for k, nh in enumerate(clean_new_hyps, 1):
+                                    if not isinstance(nh, dict):
+                                        continue
+                                    d_err, r_err = self._hypothesis_problems(nh, genes)
+                                    if d_err or r_err:
+                                        hypothesis_flags.append({'hypothesis': f'regenerated {k}',
+                                                                 'direction_errors': d_err,
+                                                                 'relation_errors': r_err})
+                                        if STEP4_REWRITE_ENABLED:
+                                            nh = self._rewrite_or_remove(
+                                                nh, genes, seed_offset=600 + 10 * regen_attempt + k,
+                                                log=self._rewrite_log, label=f'regenerated {k}')
+                                            if nh is None:
+                                                continue
+                                    checked_new.append(nh)
+                                clean_new_hyps = checked_new
+
                                 if clean_new_hyps:
                                     result['hypotheses'].extend(clean_new_hyps)
                                     # Update biochem warnings metadata
@@ -701,7 +909,9 @@ class Step04HypothesisGeneration:
                     print(f'\n  ✅ {len(result["hypotheses"])} hypotheses remain after filtering (≥ 4) — skipping regeneration')
 
             # --- Regenerate centralMechanisticModel and hypothesesSummary after filtering ---
-            if error_indices and result.get('hypotheses'):
+            # After any removal (biochemistry or the item 12/13 rewrite step), the summary
+            # of the hypotheses is rewritten from the remaining ones (main L254).
+            if (error_indices or rewrite_removed) and result.get('hypotheses'):
                 surviving_hyps = result['hypotheses']
                 print(f'\n  Regenerating central model, summary, and key predictions for {len(surviving_hyps)} surviving hypotheses...')
 
@@ -788,7 +998,10 @@ class Step04HypothesisGeneration:
                     print(f'    - {warning}')
                 print('  Hypotheses may contain cross-contaminated values between genes!')
 
-            # Auto-correct fabricated gene-level p-values and FDRs
+            # Auto-correct gene-level p-values and FDRs that differ from the computed
+            # values at the printed precision (item 25)
+            self._pathways_for_stats = list(pathways or []) + list(
+                (mechanisms_result or {}).get('pathway_structures', []) or [])
             gene_stat_corrections = self._autocorrect_gene_stats(result, genes)
             if gene_stat_corrections:
                 print(f'\n  Auto-corrected {gene_stat_corrections} fabricated gene p-value/FDR(s) in hypothesis text')
@@ -797,6 +1010,11 @@ class Step04HypothesisGeneration:
             fdr_corrections = self._autocorrect_pathway_fdr(result, genes, pathways, mechanisms_result)
             if fdr_corrections:
                 print(f'\n  Auto-corrected {fdr_corrections} pathway FDR → gene FDR substitution(s) in hypothesis text')
+
+            # Item 25: pathway NES and FDR values cited next to a pathway name.
+            pathway_stat_corrections = self._autocorrect_pathway_stats(result, pathways, mechanisms_result)
+            if pathway_stat_corrections:
+                print(f'\n  Auto-corrected {pathway_stat_corrections} pathway NES/FDR value(s) in hypothesis text')
 
             # Validate mechanistic claims against KEGG relations (warning-only)
             kegg_warnings = self._validate_kegg_claims(result, collected_kegg_relations)
@@ -834,6 +1052,7 @@ class Step04HypothesisGeneration:
             # model triggers one regeneration, after which any residual conflict has its
             # whole sentence dropped so the prose never contradicts the true direction.
             gene_fc = gene_fc_lookup(genes)
+            self._gene_fc_cased_map = _gene_fc_cased(genes)
             fc_conflicts = self._correct_fold_change_citations(result, gene_fc, seed)
 
             # Canonicalise novelty labels in the stored hypotheses (not just the rendered
@@ -866,7 +1085,16 @@ class Step04HypothesisGeneration:
                     'prediction_vs_data_warnings': prediction_warnings,
                     'kegg_relations_collected': len(collected_kegg_relations),
                     'internal_consistency_warnings': consistency_warnings,
-                    'fold_change_sign_conflicts': sorted(fc_conflicts)
+                    'fold_change_sign_conflicts': sorted(fc_conflicts),
+                    # Item 10: which pathways were queried, by whom, in how many rounds.
+                    'tool_call_log': tool_log,
+                    # Items 12/13: strict direction and relation flags, the loose-pattern
+                    # warnings, and every rewrite with the text before and after.
+                    'hypothesis_check_flags': hypothesis_flags,
+                    'direction_loose_warnings': getattr(self, '_loose_direction_warnings', []),
+                    'rewrite_enabled': STEP4_REWRITE_ENABLED,
+                    'rewrites': self._rewrite_log,
+                    'rewrite_removed': rewrite_removed,
                 }
             )
 
@@ -876,6 +1104,64 @@ class Step04HypothesisGeneration:
         except Exception as e:
             print(f'\n  Error in Step {self.step_number}: {e}')
             raise
+
+    def _hypothesis_problems(self, hyp: Dict, genes: List[Dict]):
+        """(direction errors, relation errors) for one hypothesis (items 12 and 13)."""
+        direction = hypothesis_direction_errors(hyp, _gene_fc_cased(genes))
+        relations = relation_claim_errors(
+            hyp, relation_reference(getattr(self, '_collected_relations', []) or []))
+        return direction, relations
+
+    def _rewrite_or_remove(self, hyp: Dict, genes: List[Dict], _unused=None,
+                           seed_offset: int = 400, log: Optional[List] = None,
+                           label: str = '') -> Optional[Dict]:
+        """Rewrite a hypothesis once to fix its direction / relation errors; return the
+        fixed hypothesis, or None if the rewrite still has an error (main L252).
+
+        One call at temperature 0 with a fixed seed offset. The prompt gives the true fold
+        changes of the genes the hypothesis names (as _regenerate_central_model_with_fcs
+        does) and the relations the tool calls returned. Each attempt is logged with the
+        text before and after.
+        """
+        direction, relations = self._hypothesis_problems(hyp, genes)
+        if not direction and not relations:
+            return hyp
+        gene_fc = _gene_fc_cased(genes)
+        text = json.dumps(hyp)
+        named = sorted(g for g in gene_fc if re.search(rf'(?<![\w-]){re.escape(g)}(?![\w-])', text))
+        returned = getattr(self, '_collected_relations', []) or []
+        problems = [f"- {e['gene']} is described as {e['claimed']}-regulated, but its fold change is "
+                    f"{e['fold_change']:+.2f}" for e in direction]
+        problems += [f"- The relation {e['source']} -> {e['target']} is not among the relations the "
+                     f"tool calls returned ({e.get('reason', '')})" for e in relations]
+        prompt = (
+            'Rewrite this hypothesis once to fix exactly these errors, changing nothing else:\n'
+            + '\n'.join(problems)
+            + '\n\nTrue fold changes of the genes it names:\n'
+            + '\n'.join(f'- {g}: {gene_fc[g]:+.2f}' for g in named)
+            + '\n\nRelations the tool calls returned (link two genes only through one of these; '
+              'mechanisticClaims must be gene-to-gene relations from this list):\n'
+            + ('\n'.join(f"- {r.get('source')} --[{r.get('type')}]--> {r.get('target')}"
+                         for r in returned[:200]) or '- (none)')
+            + '\n\nHypothesis (JSON):\n' + text
+            + '\n\nReturn ONLY the corrected hypothesis as one JSON object with the same fields.')
+        new_hyp = None
+        try:
+            reply = self.llm.chat([{'role': 'user', 'content': prompt}], temperature=0.0,
+                                  seed=getattr(self, '_seed', 42) + seed_offset, max_tokens=3000)
+            parsed = self._parse_llm_json(reply)
+            if isinstance(parsed, dict):
+                new_hyp = parsed.get('hypotheses', [parsed])[0] if 'hypotheses' in parsed else parsed
+        except Exception as exc:  # a failed rewrite counts as not fixed
+            print(f'  Rewrite of {label or "hypothesis"} failed: {exc}')
+        still = self._hypothesis_problems(new_hyp, genes) if isinstance(new_hyp, dict) else (direction, relations)
+        fixed = isinstance(new_hyp, dict) and not still[0] and not still[1]
+        if log is not None:
+            log.append({'hypothesis': label, 'errors_before': {'direction': direction, 'relations': relations},
+                        'before': hyp, 'after': new_hyp,
+                        'errors_after': {'direction': still[0], 'relations': still[1]},
+                        'outcome': 'rewritten' if fixed else 'removed'})
+        return new_hyp if fixed else None
 
     def _correct_fold_change_citations(
         self,
@@ -896,12 +1182,18 @@ class Step04HypothesisGeneration:
 
         all_conflicts: set = set()
 
+        gene_fc_cased = getattr(self, '_gene_fc_cased_map', None) or gene_fc
+
         def _fix_str(text):
-            """Sanitize leaked meta-commentary, then magnitude-correct FC citations."""
+            """Sanitize leaked meta-commentary, then magnitude-correct FC citations, both
+            signed ("GENE +1.22") and arrow ("GENE (↑1.22)", item 12). A wrong arrow is a
+            sign conflict, like a wrong sign."""
             if not isinstance(text, str) or not text:
                 return text, set()
             cleaned = sanitize_llm_text(text)
-            return correct_fc_citations(cleaned, gene_fc)
+            fixed, conflicts = correct_fc_citations(cleaned, gene_fc)
+            fixed, arrow_conflicts = correct_arrow_fc(fixed, gene_fc_cased)
+            return fixed, conflicts | {g.upper() for g in arrow_conflicts}
 
         # Hypothesis prose: sanitize + magnitude-only fixes across every rendered text
         # field (sign errors here are surfaced by the existing direction validator; we
@@ -1133,9 +1425,12 @@ class Step04HypothesisGeneration:
                 "hypothesis(es) for the uncovered axis(es), using the same per-hypothesis "
                 "schema as before."
             )
-            messages = [
+            # Keep the tool calls and results in the context (item 10), falling back to
+            # the bare prompts when no tool conversation exists.
+            base = list(getattr(self, '_tool_context', None) or [
                 {'role': 'system', 'content': system_prompt},
-                {'role': 'user', 'content': user_prompt},
+                {'role': 'user', 'content': user_prompt}])
+            messages = base + [
                 {'role': 'assistant', 'content': json.dumps(result)},
                 {'role': 'user', 'content': coverage_prompt},
             ]
@@ -1185,6 +1480,22 @@ class Step04HypothesisGeneration:
                 if m:
                     bad_idx.add(int(m.group(1)))
 
+            # Item 12: with the rewrite switched on, a candidate whose only problem is a
+            # direction error gets the same one-time rewrite instead of a plain reject.
+            if STEP4_REWRITE_ENABLED:
+                biochem_bad = set()
+                for err in cand_errors:
+                    m = re.match(r'Biochemistry review \(error\) - Hypothesis (\d+):', err)
+                    if m:
+                        biochem_bad.add(int(m.group(1)))
+                rewrite_log = getattr(self, '_rewrite_log', [])
+                for i, cand in enumerate(candidates, 1):
+                    if i in bad_idx and i not in biochem_bad:
+                        fixed = self._rewrite_or_remove(cand, genes, [], seed_offset=500 + i,
+                                                        log=rewrite_log, label=f'coverage candidate {i}')
+                        if fixed is not None:
+                            candidates[i - 1] = fixed
+                            bad_idx.discard(i)
             good_new = [h for i, h in enumerate(candidates, 1) if i not in bad_idx]
             if not good_new:
                 warnings.append('Coverage regeneration hypotheses failed validation')
@@ -1298,8 +1609,8 @@ Use these tools strategically to:
 - Identify pathway crosstalk and interactions
 
 CRITICAL WORKFLOW:
-1. Identify 3-5 pathways of interest from the summary table
-2. Call get_pathway_mechanism() for EACH pathway to get detailed KEGG relations
+1. Take EVERY pathway in the summary table
+2. Call get_pathway_mechanism() for EACH of them to get its detailed relations
 3. Use the detailed relations to build mechanistic models
 4. Then generate hypotheses based on the detailed mechanisms
 
@@ -1592,8 +1903,10 @@ RESPONSE FORMAT:
             shown = list(forced)
             shown_ids = set(forced_ids)
             for t in sorted_themes:
-                if len(shown) >= 5:
-                    break
+                # Every theme is shown (main L248 "KGIE describes the pathway themes");
+                # the former top-5 cap hid themes from Step 4 (item 23).
+                # if len(shown) >= 5:
+                #     break
                 if id(t) not in shown_ids:
                     shown.append(t)
                     shown_ids.add(id(t))
@@ -1666,6 +1979,9 @@ RESPONSE FORMAT:
                 )
 
         # Add pathway summary table from Step 3 (NOT full details - use tools to query)
+        # Reset first: the step object is reused across runs, and a run with no
+        # structures must not inherit the previous run's table (item 10).
+        self._table_pathways = []
         if mechanisms_result and mechanisms_result.get('pathway_structures'):
             structures = mechanisms_result['pathway_structures']
 
@@ -1709,6 +2025,9 @@ RESPONSE FORMAT:
                 if len(sorted_structures) >= TABLE_LIMIT:
                     break
                 sorted_structures.append(s)
+            # The pathways the model must query through tool calls (item 10).
+            self._table_pathways = [s.get('pathway', '') for s in sorted_structures[:TABLE_LIMIT]
+                                    if s.get('pathway')]
 
             # Build crosstalk lookup: pathway -> list of (partner_pathway, shared_gene_count)
             crosstalk_lookup = {}
@@ -1810,7 +2129,9 @@ RESPONSE FORMAT:
                     de_note = 'in DE list' if reg.get('is_de') else 'NOT in DE list'
                     activity = reg.get('inferred_tf_activity')
                     act_note = f', inferred activity {activity}' if activity and activity != 'unknown' else ''
-                    targets = ', '.join(reg.get('targets', [])[:5])
+                    # Every DE target (main L246 "lists the target genes found among the
+                    # DE genes"); the former [:5] cut listed at most five (item 24).
+                    targets = ', '.join(reg.get('targets', []))
                     prompt_parts.append(f'- **{tf}** ({de_note}{act_note}) → regulates {n} down-regulated gene(s): {targets}\n')
                 prompt_parts.append('\n')
 
@@ -1917,7 +2238,7 @@ RESPONSE FORMAT:
         # JSON format specification
         prompt_parts.append('---\n\n')
         prompt_parts.append('⚠️ **WORKFLOW REQUIREMENTS:** ⚠️\n')
-        prompt_parts.append('1. First, call get_pathway_mechanism() for 3-5 key pathways from the table above\n')
+        prompt_parts.append('1. First, call get_pathway_mechanism() for EVERY pathway in the table above\n')
         prompt_parts.append('2. Analyze the detailed KEGG relations (activation, inhibition, expression, etc.)\n')
         prompt_parts.append('3. Build mechanistic models connecting multiple pathways\n')
         prompt_parts.append('4. ONLY THEN return the final JSON with hypotheses\n')
@@ -2014,8 +2335,10 @@ RESPONSE FORMAT:
                            ' // novel = mechanism not in literature; extended = adds detail to established biology;'
                            ' confirmatory = data confirms known mechanism\n')
         prompt_parts.append('      "cellularContext": "Which cell type(s) each gene is expressed in (e.g., \'Tumor-intrinsic genes: tumor cells; IFNG, GZMB: infiltrating immune cells; secreted factors: specify source cell type\')",\n')
-        prompt_parts.append('      "mechanisticClaims": [\n')
-        prompt_parts.append('        {"source": "GENE_A", "relation": "activation|inhibition|expression|compound|association", "target": "GENE_B", "basis": "KEGG pathway name or literature"}\n')
+        # Item 13 (main L252): only gene-to-gene relations returned by the tool calls; the
+        # former basis "KEGG pathway name or literature" let unreturned relations through.
+        prompt_parts.append('      "mechanisticClaims": [  // ONLY gene-to-gene relations returned by your get_pathway_mechanism() calls; source and target must both be gene symbols\n')
+        prompt_parts.append('        {"source": "GENE_A", "relation": "activation|inhibition|expression|compound|association", "target": "GENE_B", "basis": "name of the queried pathway whose tool result lists this relation"}\n')
         prompt_parts.append('      ]\n')
         prompt_parts.append('    }\n')
         prompt_parts.append('  ],\n')
@@ -2138,10 +2461,18 @@ RESPONSE FORMAT:
         self,
         result: Dict,
         genes: List[Dict],
-        experiment_context: str = ''
+        experiment_context: str = '',
+        include_biochem: bool = True,
     ) -> List[str]:
         """
         Validate that hypotheses correctly describe gene regulation direction
+
+        Direction errors come from the strict detector (item 12: fixed shapes, word next to
+        the gene, gene matched with case, U+2010/U+2011/U+2013 read as hyphens) plus wrong
+        arrows in "GENE (↑x)" citations, over each hypothesis's statement, mechanistic
+        model and key players, and the central model. The former wide pattern only adds
+        recorded warnings (self._loose_direction_warnings). The LLM biochemistry review
+        runs only when include_biochem is True, so a re-check does not re-run it.
 
         Args:
             result: LLM hypothesis generation result
@@ -2150,6 +2481,45 @@ RESPONSE FORMAT:
         Returns:
             List of error messages (empty if no errors)
         """
+        gene_fc_cased = _gene_fc_cased(genes)
+        errors = []
+        loose = []
+        for i, hyp in enumerate(result.get('hypotheses', []) or [], 1):
+            if not isinstance(hyp, dict):
+                continue
+            strict = hypothesis_direction_errors(hyp, gene_fc_cased)
+            for e in strict:
+                true_dir = 'UP' if e['fold_change'] > 0 else 'DOWN'
+                errors.append(f"Hypothesis {i}: {e['gene']} is {true_dir}-regulated "
+                              f"(FC={e['fold_change']:.2f}) but described as {e['claimed']}-regulated")
+            flagged = {e['gene'] for e in strict}
+            for w in loose_direction_matches(
+                    (hyp.get('hypothesis', '') or '') + ' ' + (hyp.get('mechanisticModel', '') or ''),
+                    gene_fc_cased):
+                if w['gene'] not in flagged:
+                    loose.append(f"Direction warning (loose pattern) - Hypothesis {i}: {w['gene']} "
+                                 f"(FC={w['fold_change']:.2f}) may be described as {w['claimed']}-regulated")
+        central = result.get('centralMechanisticModel', '') or ''
+        for e in strict_direction_errors(central, gene_fc_cased):
+            true_dir = 'UP' if e['fold_change'] > 0 else 'DOWN'
+            errors.append(f"Central Model: {e['gene']} is {true_dir}-regulated "
+                          f"(FC={e['fold_change']:.2f}) but described as {e['claimed']}-regulated")
+        self._loose_direction_warnings = loose
+
+        if include_biochem:
+            # LLM-based biochemistry review (generalizes previous hardcoded metabolic patterns)
+            errors.extend(self._validate_biochemistry_with_llm(result, genes, experiment_context))
+        return errors
+
+    def _validate_hypothesis_directions_loose_unused(
+        self,
+        result: Dict,
+        genes: List[Dict],
+        experiment_context: str = ''
+    ) -> List[str]:
+        """Former wide-pattern direction check, kept for reference only (item 12): it
+        allowed only an ordinary hyphen, bound the farthest direction word and matched
+        gene symbols without case. Not called."""
         # Build gene lookup dict
         gene_lookup = {}
         for gene in genes:
@@ -2664,6 +3034,10 @@ Does the expert's statement CONTRADICT the hypothesis claim? Answer ONLY "CONTRA
                     text_blocks.append((f'Hypothesis {i}', text))
             for ev in hyp.get('evidenceSupporting', []):
                 text_blocks.append((f'Hypothesis {i}', ev))
+            # keyPlayers cite fold changes too ("GENE (↑1.22) – role"); item 12.
+            for kp in hyp.get('keyPlayers', []) or []:
+                if isinstance(kp, str):
+                    text_blocks.append((f'Hypothesis {i}', kp))
 
         central = result.get('centralMechanisticModel', '')
         if central:
@@ -2977,6 +3351,18 @@ Does the expert's statement CONTRADICT the hypothesis claim? Answer ONLY "CONTRA
         if not gene_stats_lookup:
             return 0
 
+        # Pathway statistics, so a pathway's p-value or FDR written near a gene is not
+        # rewritten into that gene's value (item 25).
+        pathway_stat_values = []
+        for p in getattr(self, '_pathways_for_stats', []) or []:
+            for key in ('pValue', 'pValueFDR', 'p_value', 'p_value_fdr'):
+                v = to_float(p.get(key))
+                if v:
+                    pathway_stat_values.append(v)
+
+        def _is_pathway_stat(value: float) -> bool:
+            return any(abs(value - v) <= 0.005 * v for v in pathway_stat_values)
+
         # Pattern for gene p-value claims: "GENE ... p=VALUE" or "gene p=VALUE"
         pval_claim_pattern = re.compile(
             r'(\b[A-Z][A-Z0-9]{1,15}\b)(.{0,80}?(?:gene\s+)?p\s*[=<]\s*)'
@@ -2989,6 +3375,46 @@ Does the expert's statement CONTRADICT the hypothesis claim? Answer ONLY "CONTRA
             r'(\d+\.?\d*e[−\-\u2011]\d+|\d+\.?\d*\s*[×xX*]\s*10\s*[\^]?\s*[−\-\u2011]\s*\d+|0\.\d{3,})',
             re.IGNORECASE
         )
+
+        # The value is attributed to the NEAREST known gene before it (same sentence, at
+        # most 80 characters back). The patterns above bound the leftmost capitalised word
+        # instead (IGNORECASE made every word a candidate): "MYC activates CDK1
+        # (p = 1.2e-05)" checked MYC, and "The CDK1 p=..." checked "THE". With item 25's
+        # printed-precision rule that wrote one gene's value over another's.
+        pval_value_pattern = re.compile(
+            r'(?<![\w\-])(?:gene\s+)?[pP]\s*[=<]\s*'
+            r'(?P<v>\d+\.?\d*[eE][−\-‑]\d+|\d+\.?\d*\s*[×xX*]\s*10\s*[\^]?\s*[−\-‑]\s*\d+)')
+        fdr_value_pattern = re.compile(
+            r'(?<![\w\-])(?:gene\s+)?(?:FDR|fdr)\s*[=<≈]\s*'
+            r'(?P<v>\d+\.?\d*[eE][−\-‑]\d+|\d+\.?\d*\s*[×xX*]\s*10\s*[\^]?\s*[−\-‑]\s*\d+|0\.\d{3,})')
+        gene_token = re.compile(r'(?<![\w\-])([A-Za-z][A-Za-z0-9\-]{1,15})(?![\w])')
+
+        def _sub_nearest_gene(text: str, value_pattern, replacer) -> str:
+            edits = []
+            for vm in value_pattern.finditer(text):
+                window_start = max(0, vm.start() - 80)
+                before = text[window_start:vm.start()]
+                cut = max(before.rfind('. '), before.rfind('; '))
+                if cut >= 0:
+                    window_start += cut + 2
+                    before = text[window_start:vm.start()]
+                gene_m = None
+                for gm in gene_token.finditer(before):
+                    if gm.group(1).upper() in gene_stats_lookup:
+                        gene_m = gm
+                if gene_m is None:
+                    continue
+                g_start = window_start + gene_m.start(1)
+                gene, value = gene_m.group(1), vm.group('v')
+                prefix = text[g_start + len(gene):vm.start('v')]
+                original = gene + prefix + value
+                new = replacer(_GeneStatMatch(gene, prefix, value))
+                if new != original:
+                    # Only the value changes; the replacer returns gene + prefix + value.
+                    edits.append((vm.start('v'), vm.end('v'), new[len(gene) + len(prefix):]))
+            for s, e, new in sorted(edits, reverse=True):
+                text = text[:s] + new + text[e:]
+            return text
 
         corrections = 0
 
@@ -3025,14 +3451,21 @@ Does the expert's statement CONTRADICT the hypothesis claim? Answer ONLY "CONTRA
                 if claimed_pval <= 0:
                     return match.group(0)
 
-                log_diff = abs(math.log10(claimed_pval) - math.log10(actual_pval))
-                if log_diff > 1.0:
+                # Item 25 (main L252): replace any value that differs from the computed
+                # one at the printed precision. The former rule replaced only values more
+                # than tenfold off (|log10 difference| > 1). A value that is a pathway's
+                # statistic is left to the pathway checks.
+                # log_diff = abs(math.log10(claimed_pval) - math.log10(actual_pval))
+                # if log_diff > 1.0:
+                if differs_at_printed_precision(pval_str, actual_pval) and \
+                        not _is_pathway_stat(claimed_pval):
                     corrections += 1
                     return f"{match.group(1)}{prefix}{actual_pval:.2e}"
 
                 return match.group(0)
 
-            return pval_claim_pattern.sub(pval_replacer, text)
+            # return pval_claim_pattern.sub(pval_replacer, text)  # bound the leftmost word
+            return _sub_nearest_gene(text, pval_value_pattern, pval_replacer)
 
         def _correct_fdrs(text: str) -> str:
             nonlocal corrections
@@ -3059,36 +3492,62 @@ Does the expert's statement CONTRADICT the hypothesis claim? Answer ONLY "CONTRA
                 if claimed_fdr <= 0:
                     return match.group(0)
 
-                log_diff = abs(math.log10(claimed_fdr) - math.log10(actual_fdr))
-                if log_diff > 1.0:
+                # Item 25: differs at the printed precision (was: more than tenfold off).
+                # log_diff = abs(math.log10(claimed_fdr) - math.log10(actual_fdr))
+                # if log_diff > 1.0:
+                if differs_at_printed_precision(fdr_str, actual_fdr) and \
+                        not _is_pathway_stat(claimed_fdr):
                     corrections += 1
                     return f"{match.group(1)}{prefix}{actual_fdr:.2e}"
 
                 return match.group(0)
 
-            return fdr_claim_pattern.sub(fdr_replacer, text)
+            # return fdr_claim_pattern.sub(fdr_replacer, text)  # bound the leftmost word
+            return _sub_nearest_gene(text, fdr_value_pattern, fdr_replacer)
 
         def _correct_field(text: str) -> str:
             text = _correct_pvals(text)
             text = _correct_fdrs(text)
             return text
 
-        # Correct text fields in each hypothesis
-        for hyp in result.get('hypotheses', []):
-            for field in ['hypothesis', 'mechanisticModel', 'confidenceRationale']:
-                if hyp.get(field):
-                    hyp[field] = _correct_field(hyp[field])
-            # Correct evidence list
-            if hyp.get('evidenceSupporting'):
-                hyp['evidenceSupporting'] = [_correct_field(ev) for ev in hyp['evidenceSupporting']]
-
-        # Correct central model and summary
-        if result.get('centralMechanisticModel'):
-            result['centralMechanisticModel'] = _correct_field(result['centralMechanisticModel'])
-        if result.get('hypothesesSummary'):
-            result['hypothesesSummary'] = _correct_field(result['hypothesesSummary'])
-
+        # Correct every printed field (item 25): the former list skipped keyPlayers,
+        # testability and the predictions.
+        _apply_to_printed_fields(result, _correct_field)
         return corrections
+
+    def _autocorrect_pathway_stats(self, result: Dict, pathways: List[Dict],
+                                   mechanisms_result: Optional[Dict] = None) -> int:
+        """Correct pathway NES and FDR values cited right after a pathway name, in every
+        printed field (item 25, main L252). Returns the number of corrections."""
+        stats: Dict[str, Dict[str, Optional[float]]] = {}
+        for p in pathways or []:
+            name = p.get('name') or p.get('pathwayName')
+            if not name:
+                continue
+            nes, metric = _enrichment_metric(p)
+            fdr = to_float(p.get('pValueFDR'))
+            if fdr is None:
+                fdr = to_float(p.get('p_value_fdr'))
+            # 'metric' (NES or ES) so an ES citation is never overwritten with an NES value.
+            stats[name] = {'nes': to_float(nes), 'fdr': fdr, 'metric': metric}
+        for s in (mechanisms_result or {}).get('pathway_structures', []) or []:
+            name = s.get('pathway')
+            if name and name not in stats:
+                stats[name] = {'nes': to_float(s.get('enrichment_score')),
+                               'fdr': to_float(s.get('p_value_fdr')),
+                               'metric': s.get('enrichment_metric')}
+        if not stats:
+            return 0
+        total = 0
+
+        def fix(text):
+            nonlocal total
+            new, n = correct_pathway_stats(text, stats)
+            total += n
+            return new
+
+        _apply_to_printed_fields(result, fix)
+        return total
 
     def _autocorrect_pathway_fdr(
         self,
@@ -3514,21 +3973,19 @@ Does the expert's statement CONTRADICT the hypothesis claim? Answer ONLY "CONTRA
         collected_kegg_relations: List[Dict]
     ) -> List[str]:
         """
-        Validate mechanistic claims against collected KEGG relations.
+        Check mechanistic claims against the relations the tool calls returned (item 13).
 
-        Each hypothesis may include a 'mechanisticClaims' list with entries like:
+        Each hypothesis carries a 'mechanisticClaims' list of gene-to-gene relations:
             {"source": "GENE_A", "relation": "activation", "target": "GENE_B", "basis": "..."}
 
-        This method checks each claim's (source, target) pair against the KEGG
-        relations collected during tool calls. Unsupported claims are flagged
-        and each hypothesis is annotated with a 'keggValidation' summary.
-
-        Known limitation: Low validation rates (0-30%) are expected because
-        ``collected_kegg_relations`` only contains relations from the 3-5
-        pathways explicitly queried via tools during hypothesis generation.
-        Well-known biology (e.g., IFNG→STAT1) that was not part of any queried
-        pathway will be flagged as unsupported. These warnings are informational
-        and do not necessarily indicate errors in the hypothesis.
+        Main L252: a hypothesis that "lists a relation that the tool calls did not return"
+        is an error. The reference is the curatedRelations of every get_pathway_mechanism
+        result in the conversation (model calls and the engine's coverage fill, item 10),
+        so it covers every table pathway. Undirected relation types match in either
+        direction. A claim that is not gene-to-gene fails (no claim is exempt). With no
+        relation returned at all, every claim fails; the former early return skipped the
+        check in that case. Each hypothesis is annotated with 'keggValidation'. Acting on
+        the failures (rewrite once, then remove) happens in the item 12/13 rewrite step.
 
         Args:
             result: Parsed hypothesis generation result dict
@@ -3537,37 +3994,17 @@ Does the expert's statement CONTRADICT the hypothesis claim? Answer ONLY "CONTRA
         Returns:
             List of warning messages (empty if no issues)
         """
-        if not collected_kegg_relations:
-            return []
-
-        # Build lookup sets: {(SOURCE, TARGET)} and {(SOURCE, TARGET, TYPE)}
-        kegg_pairs = set()
-        kegg_triples = set()
-        for rel in collected_kegg_relations:
-            pair = (rel['source'], rel['target'])
-            triple = (rel['source'], rel['target'], rel['type'])
-            kegg_pairs.add(pair)
-            kegg_triples.add(triple)
+        # if not collected_kegg_relations: return []  # removed: nothing returned means every claim fails (item 13)
+        reference = relation_reference(collected_kegg_relations or [])
 
         warnings = []
 
         for i, hyp in enumerate(result.get('hypotheses', []), 1):
-            claims = hyp.get('mechanisticClaims', [])
-            unsupported = []
-
-            for claim in claims:
-                source = claim.get('source', '').upper()
-                target = claim.get('target', '').upper()
-                relation = claim.get('relation', '')
-
-                if not source or not target:
-                    continue
-
-                # Check if (source, target) pair exists in ANY collected KEGG relation
-                if (source, target) not in kegg_pairs:
-                    unsupported.append(
-                        f"{source} -> {target} ({relation})"
-                    )
+            claims = hyp.get('mechanisticClaims', []) or []
+            unsupported = [
+                f"{e['source']} -> {e['target']} ({e.get('relation') or ''}; {e.get('reason')})"
+                for e in relation_claim_errors(hyp, reference)
+            ]
 
             if unsupported:
                 warnings.append(
